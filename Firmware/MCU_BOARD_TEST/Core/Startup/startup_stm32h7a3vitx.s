@@ -95,6 +95,20 @@ LoopFillZerobss:
   cmp r2, r4
   bcc FillZerobss
 
+/* Zero fill the non-cacheable bss segment (RAM_CD). */
+  ldr r2, =__nc_bss_start__
+  ldr r4, =__nc_bss_end__
+  movs r3, #0
+  b LoopFillZeroNcbss
+
+FillZeroNcbss:
+  str  r3, [r2]
+  adds r2, r2, #4
+
+LoopFillZeroNcbss:
+  cmp r2, r4
+  bcc FillZeroNcbss
+
 /* Call static constructors */
     bl __libc_init_array
 /* Call the application's entry point.*/

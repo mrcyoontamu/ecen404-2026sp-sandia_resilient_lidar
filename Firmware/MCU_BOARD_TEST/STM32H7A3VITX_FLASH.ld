@@ -147,9 +147,11 @@ SECTIONS
     /* This is used by the startup in order to initialize the .bss section */
     _sbss = .;         /* define a global symbol at bss start */
     __bss_start__ = _sbss;
-    *(.bss)
-    *(.bss*)
-    *(COMMON)
+    *(EXCLUDE_FILE(*usbd_cdc_if.o) .bss)
+    *(EXCLUDE_FILE(*usbd_cdc_if.o) .bss*)
+    /* Some toolchains/flags can emit uninitialized globals as COMMON symbols.
+       Exclude usbd_cdc_if.o here so its buffers don't get grabbed into cached RAM. */
+    *(EXCLUDE_FILE(*usbd_cdc_if.o) COMMON)
 
     . = ALIGN(4);
     _ebss = .;         /* define a global symbol at bss end */
@@ -166,6 +168,25 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
+  
+  .RamData_NonCacheable (NOLOAD) :
+  {
+    /* Keep this region aligned to the MPU region size (4KB). */
+    . = ALIGN(4096);
+    __nc_bss_start__ = .;
+    /* Lasso CDC buffers (CubeMX may rewrite usbd_cdc_if.c) */
+    *usbd_cdc_if.o(.bss)
+    *usbd_cdc_if.o(.bss*)
+    *usbd_cdc_if.o(COMMON)
+    /* Optional: allow manual placement via section attributes too */
+    *(.RamData_NonCacheable)
+    . = ALIGN(32);
+    __nc_bss_end__ = .;
+  } >RAM_CD
+
+  /* Ensure the lasso'd non-cacheable region stays within the 4KB MPU window.
+     If you intentionally grow it, increase the MPU region size accordingly. */
+  ASSERT((__nc_bss_end__ - __nc_bss_start__) <= 0x1000, "RAM_CD non-cacheable region exceeds 4KB (MPU region 0)")
 
   /* Remove information from the standard libraries */
   /DISCARD/ :

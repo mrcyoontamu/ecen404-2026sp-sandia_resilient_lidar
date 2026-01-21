@@ -18,10 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
 
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,22 +45,22 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
 
-UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
-
+extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_USART1_UART_Init(void);
+static void MX_I2C2_Init(void);
+static void MX_USART6_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+void I2C_Scanner(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -78,6 +82,14 @@ int main(void)
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
 
+  /* Enable the CPU Cache */
+
+  /* Enable I-Cache---------------------------------------------------------*/
+  SCB_EnableICache();
+
+  /* Enable D-Cache---------------------------------------------------------*/
+  SCB_EnableDCache();
+
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -96,8 +108,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
-  MX_USART1_UART_Init();
+  MX_I2C2_Init();
+  MX_USART6_UART_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -106,6 +119,29 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	I2C_Scanner();
+	HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+	static uint32_t counter = 0;
+
+	// 1. Format the string directly into the Safe Buffer
+	// (This works safely because UserTxBufferHS is in the MPU protected area)
+	int len = sprintf((char *)UserTxBufferHS, "STM32 Alive! Count: %lu\r\n", counter++);
+
+	// 2. Send the data
+	// We check if the USB is free (USBD_OK) before sending
+	if (CDC_Transmit_HS(UserTxBufferHS, len) == USBD_OK)
+	{
+	    // Optional: Toggle an LED here to visualize successful transmission
+	    // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+	}
+	else
+	{
+	    // If USB was busy, we just skip this frame and try again next time
+	}
+
+	// 3. Wait a bit so we don't flood the terminal
+	HAL_Delay(1000);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -131,17 +167,25 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
-  RCC_OscInitStruct.HSICalibrationValue = 64;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 5;
+  RCC_OscInitStruct.PLL.PLLN = 112;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -152,113 +196,113 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_6) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
 /**
-  * @brief I2C1 Initialization Function
+  * @brief I2C2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_I2C1_Init(void)
+static void MX_I2C2_Init(void)
 {
 
-  /* USER CODE BEGIN I2C1_Init 0 */
+  /* USER CODE BEGIN I2C2_Init 0 */
 
-  /* USER CODE END I2C1_Init 0 */
+  /* USER CODE END I2C2_Init 0 */
 
-  /* USER CODE BEGIN I2C1_Init 1 */
+  /* USER CODE BEGIN I2C2_Init 1 */
 
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00707CBB;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x20B0CCFF;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
   {
     Error_Handler();
   }
 
   /** Configure Analogue filter
   */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
 
   /** Configure Digital filter
   */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C1_Init 2 */
+  /* USER CODE BEGIN I2C2_Init 2 */
 
-  /* USER CODE END I2C1_Init 2 */
+  /* USER CODE END I2C2_Init 2 */
 
 }
 
 /**
-  * @brief USART1 Initialization Function
+  * @brief USART6 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART1_UART_Init(void)
+static void MX_USART6_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART1_Init 0 */
+  /* USER CODE BEGIN USART6_Init 0 */
 
-  /* USER CODE END USART1_Init 0 */
+  /* USER CODE END USART6_Init 0 */
 
-  /* USER CODE BEGIN USART1_Init 1 */
+  /* USER CODE BEGIN USART6_Init 1 */
 
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart6.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart6.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart6.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart6, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart6, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  if (HAL_UARTEx_DisableFifoMode(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
+  /* USER CODE BEGIN USART6_Init 2 */
 
-  /* USER CODE END USART1_Init 2 */
+  /* USER CODE END USART6_Init 2 */
 
 }
 
@@ -269,13 +313,27 @@ static void MX_USART1_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : LED_Pin */
+  GPIO_InitStruct.Pin = LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -283,7 +341,50 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
+void I2C_Scanner(void)
+{
+    char msg[64];
+    HAL_UART_Transmit(&huart6, (uint8_t*)"Scanning I2C bus...\r\n", 21, 100);
 
+    HAL_StatusTypeDef result;
+    uint8_t i;
+    int count = 0;
+
+    for (i = 1; i < 128; i++)
+    {
+        /*
+         * HAL_I2C_IsDeviceReady checks if a device acknowledges an address.
+         * Params:
+         * 1. I2C Handle (&hi2c1)
+         * 2. Device Address (shifted left by 1)
+         * 3. Number of trials (1 is usually enough)
+         * 4. Timeout in ms (10ms)
+         */
+        result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(i << 1), 1, 10);
+
+        if (result == HAL_OK)
+        {
+            sprintf(msg, "I2C device found at address: 0x%02X\r\n", i);
+            HAL_UART_Transmit(&huart6, (uint8_t*)msg, strlen(msg), 100);
+            count++;
+        }
+    }
+
+    if (count == 0)
+    {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"No I2C devices found.\r\n", 25, 100);
+    }
+    else
+    {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"Scan Complete.\r\n", 16, 100);
+    }
+}
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
+/************************************************* USER DEFINED FUNCTIONS ********************************************/
 /* USER CODE END 4 */
 
  /* MPU Configuration */
@@ -299,11 +400,11 @@ void MPU_Config(void)
   */
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-  MPU_InitStruct.BaseAddress = 0x0;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
-  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.BaseAddress = 0x30000000;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_4KB;
+  MPU_InitStruct.SubRegionDisable = 0x0;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
-  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
   MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
   MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
