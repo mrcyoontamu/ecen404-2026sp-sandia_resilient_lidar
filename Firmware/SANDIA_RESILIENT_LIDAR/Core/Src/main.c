@@ -28,9 +28,6 @@
 
 #include "usbd_cdc_if.h"
 
-#include "common.h"
-#include "ov7670.h"
-
 #include "core_cm7.h"
 /* USER CODE END Includes */
 
@@ -80,10 +77,6 @@ static void MX_DCMI_Init(void);
 /* USER CODE BEGIN PFP */
 void I2C_Scanner(void);
 
-void vprint(const char *fmt, va_list argp);
-void my_printf(const char *fmt, ...);
-
-void usb_printf(char *msg);
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
 
 void DWT_Init(void);
@@ -141,13 +134,6 @@ int main(void)
   /* USER CODE BEGIN 2 */
   DWT_Init();
 
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET); //Camera PWDN to GND
-  ov7670_init(&hdcmi, &hdma_dcmi, &hi2c2);
-  ov7670_config(OV7670_MODE_QVGA_RGB565);
-  ov7670_stopCap();
-
-  const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
-
   uint32_t last_frame_tick = 0;
   uint32_t loop_tick = 0;
   uint32_t frame_timeout_ms = 1000;
@@ -158,7 +144,6 @@ int main(void)
   uint32_t start_cycles, end_cycles, delta_cycles;
   float time_us;
 
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -172,63 +157,6 @@ int main(void)
 		  loop_tick = HAL_GetTick();
 	  }
 
-	  if(frame_ready == 1)
-	  {
-
-//		  my_printf("DCMI frame capture duration: %.3f\r\n", (float)(tDCMI_end - tDCMI_start) / cpu_freq_mhz);
-
-		  frame_ready = 0;
-
-		  // Marked for death, I think this is useless
-		  while (HAL_DCMI_GetState(&hdcmi) != HAL_DCMI_STATE_READY)
-		  {
-			  HAL_Delay(100);// optional: add timeout protection here
-		  }
-
-
-
-		  start_cycles = DWT->CYCCNT;
-		  while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);	// Waiting loop
-
-		  USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
-		  uint8_t* p_buffer = (uint8_t*)frame_buffer;
-		  uint32_t bytes_remaining = 320 * 240 * 2; // 153,600
-		  uint16_t chunk_size;
-
-		  while (bytes_remaining > 0)
-		  {
-			  // Calculate the size of the next chunk
-			  if (bytes_remaining > 65535) {
-				  chunk_size = 65535;
-			  } else {
-				  chunk_size = (uint16_t)bytes_remaining;
-			  }
-
-			  // Send the chunk
-			  USB_Transmit_Blocking(p_buffer, chunk_size);
-
-			  // Move the pointer and update the remaining count
-			  p_buffer += chunk_size;
-			  bytes_remaining -= chunk_size;
-		  }
-		  end_cycles = DWT->CYCCNT;
-//		  my_printf("USB frame transmission: %.3f\r\n", (float)(end_cycles - start_cycles) / cpu_freq_mhz);
-		  HAL_DCMI_Stop(&hdcmi);
-
-		  // Start our tDCMI counter
-		  tDCMI_start = DWT->CYCCNT;
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
-		  last_frame_tick = HAL_GetTick();
-	  }
-	  if (HAL_GetTick() - last_frame_tick > frame_timeout_ms)
-	  {
-		  HAL_DCMI_Stop(&hdcmi);
-		  HAL_DCMI_DeInit(&hdcmi);
-		  MX_DCMI_Init(); // call your CubeMX-generated init function again
-
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
-		  last_frame_tick = HAL_GetTick();
-	  }
 // SOME OLD CODE TO TEST I2C AND USB
 //	  I2C_Scanner();
 //	  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
@@ -342,7 +270,7 @@ static void MX_DCMI_Init(void)
   hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
   hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_LOW;
   hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
-  hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_8B;
+  hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_12B;
   hdcmi.Init.JPEGMode = DCMI_JPEG_DISABLE;
   hdcmi.Init.ByteSelectMode = DCMI_BSM_ALL;
   hdcmi.Init.ByteSelectStart = DCMI_OEBS_ODD;
@@ -438,19 +366,62 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LED_Pin|GPIO_PIN_2|CAMERA_RESET_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : LED_Pin PD2 CAMERA_RESET_Pin */
-  GPIO_InitStruct.Pin = LED_Pin|GPIO_PIN_2|CAMERA_RESET_Pin;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(CC_RESET_GPIO_Port, CC_RESET_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(CC_SHUTTER_GPIO_Port, CC_SHUTTER_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOE, ENABLE_5V_10V_Pin|ENABLE_1V8_3V3_Pin|ENABLE_NEG10V_Pin|LED1_Pin
+                          |ENABLE_15V_Pin|LED4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : LED3_Pin */
+  GPIO_InitStruct.Pin = LED3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED3_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : CC_RESET_Pin */
+  GPIO_InitStruct.Pin = CC_RESET_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CC_RESET_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : CC_SHUTTER_Pin */
+  GPIO_InitStruct.Pin = CC_SHUTTER_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CC_SHUTTER_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : ENABLE_5V_10V_Pin ENABLE_1V8_3V3_Pin ENABLE_NEG10V_Pin LED1_Pin
+                           ENABLE_15V_Pin LED4_Pin */
+  GPIO_InitStruct.Pin = ENABLE_5V_10V_Pin|ENABLE_1V8_3V3_Pin|ENABLE_NEG10V_Pin|LED1_Pin
+                          |ENABLE_15V_Pin|LED4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED2_Pin */
+  GPIO_InitStruct.Pin = LED2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED2_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -499,42 +470,6 @@ static void MX_GPIO_Init(void)
 //        HAL_UART_Transmit(&huart6, (uint8_t*)"Scan Complete.\r\n", 16, 100);
 //    }
 //}
-//void vprint(const char *fmt, va_list argp) {
-//	char string[200];
-//	if (0 < vsprintf(string, fmt, argp)) // build string
-//	{
-//		HAL_UART_Transmit(&huart3, (uint8_t*) string, strlen(string), 0xffffff); // send message via UART
-//	}
-//}
-//
-//void my_printf(const char *fmt, ...) // custom printf() function
-//{
-//	va_list argp;
-//	va_start(argp, fmt);
-//	vprint(fmt, argp);
-//	va_end(argp);
-//}
-void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
-{
-  // This function is called by the HAL when the DMA has
-  // successfully captured a complete frame.
-
-  // 1. Set our flag so the main loop knows it can send the data
-  frame_ready = 1;
-  tDCMI_end = DWT->CYCCNT;
-
-//  // 2. Stop the DCMI from capturing more frames
-//  //    We will restart it manually after we're done sending.
-}
-
-void usb_printf(char *msg)
-{
-	if (hUsbDeviceHS.dev_state == USBD_STATE_CONFIGURED)
-	{
-	  // 3. Send the data
-	  CDC_Transmit_HS((uint8_t*)msg, strlen(msg));
-	}
-}
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
 {
