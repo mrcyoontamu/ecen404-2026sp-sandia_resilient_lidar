@@ -153,7 +153,7 @@ int main(void)
 	  // Blinking light to make sure main loop is still running
 	  if (HAL_GetTick() - loop_tick > frame_timeout_ms)
 	  {
-		  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+		  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
 		  loop_tick = HAL_GetTick();
 	  }
 

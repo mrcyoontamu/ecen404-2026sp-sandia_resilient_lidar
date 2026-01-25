@@ -9,8 +9,28 @@
 #define INC_EPC660_REG_H_
 
 
+#define EPC_I2C_ADDR					(0x20 << 1)
+
+// ID Registers
 #define EPC_REG_IC_TYPE					0x00
 #define EPC_REG_IC_VERSION				0x01
+#define EPC_CHIP_ID_EXPECTED			0x02
+
+#define EPC_REG_MODE_CONTROL			0xA4
+#define EPC_REG_INT_TIME_LOW			0xA2	// Integration time low bit
+#define EPC_REG_INT_TIME_HIGH			0xA3	// Integration time high bit
+
+// EEPROM stuff
+#define EPC_REG_RAM_PAGE				0x80
+#define EPC_REG_EEPROM_ADDR				0x11
+#define EPC_REG_EEPROM_DATA				0x12
+
+// Temperature Sensors
+#define EPC_REG_TEMP_TL					0x60	// Top-left sensor
+#define EPC_REG_TEMP_TR					0x62	// Top-right sensor
+#define EPC_REG_TEMP_BL					0x64
+#define EPC_REG_TEMP_BR					0x66
+
 
 
 //  AI GENERATED FOR REFERENCE

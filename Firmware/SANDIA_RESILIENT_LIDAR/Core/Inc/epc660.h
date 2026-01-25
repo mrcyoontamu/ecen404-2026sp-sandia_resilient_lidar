@@ -8,9 +8,13 @@
 #ifndef INC_EPC660_H_
 #define INC_EPC660_H_
 
-typedef enum {
-    EPC_DIRECT   = 0,  // Standard I2C write
-    EPC_INDIRECT = 1   // Special EEPROM/Sequencer write
-} epc_access_t;
+#include "epc660_platform.h"
+
+// TYPE DEFINITIONS
+
+// FUNCTION PROTOTYPES
+epc_status_t epc660_power_up(void);
+void epc660_power_down(void);
+
 
 #endif /* INC_EPC660_H_ */
