@@ -25,6 +25,9 @@
 #define EPC_REG_EEPROM_ADDR				0x11
 #define EPC_REG_EEPROM_DATA				0x12
 
+// On Boot-up
+#define EPC_REG_CFG_READY				0x7E
+
 // Temperature Sensors
 #define EPC_REG_TEMP_TL					0x60	// Top-left sensor
 #define EPC_REG_TEMP_TR					0x62	// Top-right sensor

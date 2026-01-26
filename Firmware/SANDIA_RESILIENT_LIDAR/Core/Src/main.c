@@ -29,6 +29,8 @@
 #include "usbd_cdc_if.h"
 
 #include "core_cm7.h"
+
+#include "epc660.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,6 +67,10 @@ volatile uint8_t frame_ready = 0;
 
 // Some timer variables to be used with DWT
 volatile uint32_t tDCMI_start, tDCMI_end;
+
+// Watchdog counter
+volatile uint32_t g_last_feed_time = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -184,6 +190,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+	  // Feed the dog
+	  g_last_feed_time = HAL_GetTick();
   }
   /* USER CODE END 3 */
 }
@@ -545,6 +554,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  epc_emergency_power_down();
   __disable_irq();
   while (1)
   {

@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "epc660.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,7 +42,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-
+extern volatile uint32_t g_last_feed_time;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,7 +87,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  epc_emergency_power_down();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -190,6 +191,24 @@ void SysTick_Handler(void)
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
+  // WATCHDOG LOGIC
+  uint32_t current_time = HAL_GetTick();
+
+  // Calculate difference
+  uint32_t diff;
+  if (current_time >= g_last_feed_time)
+  {
+      diff = current_time - g_last_feed_time;
+  }
+  else	// Wrap-around logic
+  {
+      diff = 0;
+  }
+
+  if (diff > 5000)	// Currently set to 5 seconds, probably should be decreased later
+  {
+      Error_Handler();
+  }
   /* USER CODE END SysTick_IRQn 1 */
 }
 

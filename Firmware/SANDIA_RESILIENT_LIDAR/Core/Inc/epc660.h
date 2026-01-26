@@ -15,6 +15,7 @@
 // FUNCTION PROTOTYPES
 epc_status_t epc660_power_up(void);
 void epc660_power_down(void);
+void epc_emergency_power_down(void);
 
 
 #endif /* INC_EPC660_H_ */

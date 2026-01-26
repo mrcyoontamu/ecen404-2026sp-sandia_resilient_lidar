@@ -27,6 +27,7 @@ typedef enum {
 
 // FUNCTION PROTOTYPES
 void epc_reset_pin_set(int state);
+void epc_shutter_pin_set(int state);
 
 void epc_power_1v8_3v3_set(int state);
 void epc_power_5v_10v_set(int state);
@@ -34,6 +35,7 @@ void epc_power_neg10v_set(int state);
 void epc_power_15v_set(int state);
 
 void epc_delay_ms(uint32_t ms);
+void epc_emergency_delay(uint32_t loop_count);
 
 epc_status_t epc_i2c_write(uint8_t reg_addr, uint8_t value, epc_i2c_access_t type);
 epc_status_t epc_i2c_read(uint8_t reg_addr, uint8_t *value, epc_i2c_access_t type);

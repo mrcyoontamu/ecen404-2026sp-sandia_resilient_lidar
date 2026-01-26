@@ -96,6 +96,16 @@ void epc_reset_pin_set(int state)
 	}
 }
 
+void epc_shutter_pin_set(int state)
+{
+	if (state == 1){
+		HAL_GPIO_WritePin(CC_SHUTTER_GPIO_Port, CC_SHUTTER_Pin, GPIO_PIN_SET);
+	}
+	else{
+		HAL_GPIO_WritePin(CC_SHUTTER_GPIO_Port, CC_SHUTTER_Pin, GPIO_PIN_RESET);
+	}
+}
+
 
 // VOLTAGE FUNCTIONS
 void epc_power_1v8_3v3_set(int state)
@@ -137,11 +147,20 @@ void epc_power_15v_set(int state)
 	}
 }
 
+
 // TIME FUNCTIONS
 void epc_delay_ms(uint32_t ms)
 {
 	HAL_Delay(ms);
 }
+
+void epc_emergency_delay(uint32_t loop_count)
+{
+    for (volatile uint32_t i = 0; i < loop_count; i++) {
+        __asm("nop"); // Assembly "No Operation" to prevent optimization
+    }
+}
+
 
 // I2C FUNCTIONS
 epc_status_t epc_i2c_write(uint8_t reg_addr, uint8_t value, epc_i2c_access_t type)
