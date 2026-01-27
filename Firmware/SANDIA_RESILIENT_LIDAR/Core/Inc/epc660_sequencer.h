@@ -8,6 +8,8 @@
 #ifndef INC_EPC660_SEQUENCER_H_
 #define INC_EPC660_SEQUENCER_H_
 
+#include "epc660_platform.h"
 
+epc_status_t epc660_sequencer_load(void);
 
 #endif /* INC_EPC660_SEQUENCER_H_ */
