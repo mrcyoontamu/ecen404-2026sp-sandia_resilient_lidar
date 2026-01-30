@@ -8,6 +8,9 @@
 *.su
 *.elf
 
+# Workspace metadata (local to your machine)
+.metadata/
+
 # --- Altium Placeholders ---
 # (We will add strict Altium ignores later when the team is ready)
 */History/
