@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: C:\Users\E4052\Classes\7thSem\ECEN403\PCB\Lidar_MCU_3\Lidar_MCU_3\Lidar_MCU_PCB_3.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=lidar_mcu_pcb_3-roundholes.txt|DrillLayers=gtl,gp1,gp2,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=lidar_mcu_pcb_3-slotholes.txt|DrillLayers=gtl,gp1,gp2,gbl

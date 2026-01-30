@@ -1,0 +1,10 @@
+Output: Generates pick and place files
+Type  : Pick Place
+From  : Variant [[No Variations]] of Project [Lidar_MCU_3.PrjPcb]
+   Generated File[Pick Place for Lidar_MCU_PCB_3.csv]
+
+
+Files Generated   : 1
+Documents Printed : 0
+
+Finished Output Generation At 4:29:09 PM On 11/4/2025

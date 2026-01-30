@@ -1,0 +1,21 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: Lidar_MCU_PCB_3.PcbDoc   11/4/2025  4:15:29 PM
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top Layer 1 to Bottom Layer 1
+ASCII RoundHoles File : Lidar_MCU_PCB_3-RoundHoles.TXT
+ASCII SlotHoles File : Lidar_MCU_PCB_3-SlotHoles.TXT
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      0.305mm (12mil)                                           Round             18        PTH        74.34mm (2.93inch)
+T2      0.356mm (14mil)                                           Round             33        PTH        228.56mm (9.00inch)
+T3      0.5mm (20mil)                                             Slot              2         PTH        15.33mm (0.60inch)
+T4      0.55mm (22mil)                                            Slot              2         PTH        10.35mm (0.41inch)
+T5      1.02mm (40mil)                                            Round             12        PTH        30.48mm (1.20inch)
+T6      1.1mm (43mil)                                             Round             32        PTH        138.18mm (5.44inch)
+T7      3.4mm (134mil)                                            Round             4         PTH        133.35mm (5.25inch)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              103
+
+Total Processing Time (hh:mm:ss) : 00:00:00

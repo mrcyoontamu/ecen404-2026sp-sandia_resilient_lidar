@@ -1,0 +1,3 @@
+Added Pin To Net: NetName=Enable_15VDC Pin=J2-8
+Added Pin To Net: NetName=Enable_15VDC Pin=U1-44
+Added Net: Name=Enable_15VDC
