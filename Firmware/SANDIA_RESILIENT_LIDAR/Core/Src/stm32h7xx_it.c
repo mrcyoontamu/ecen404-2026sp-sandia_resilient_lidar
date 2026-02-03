@@ -205,7 +205,7 @@ void SysTick_Handler(void)
       diff = 0;
   }
 
-  if (diff > 5000)	// Currently set to 5 seconds, probably should be decreased later
+  if (diff > 100000)	// Currently set to 100 seconds, probably should be decreased later
   {
       Error_Handler();
   }

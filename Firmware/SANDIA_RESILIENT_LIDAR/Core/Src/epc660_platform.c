@@ -187,7 +187,7 @@ epc_status_t epc_i2c_read(uint8_t reg_addr, uint8_t *value, epc_i2c_access_t typ
 	}
 }
 
-epc_status_t epc_i2c_write_multi(uint8_t reg_addr, uint8_t *data, uint16_t len)
+epc_status_t epc_i2c_write_multi(uint8_t reg_addr, const uint8_t *data, uint16_t len)
 {
 	HAL_StatusTypeDef status;
 
@@ -195,7 +195,7 @@ epc_status_t epc_i2c_write_multi(uint8_t reg_addr, uint8_t *data, uint16_t len)
 			EPC_I2C_ADDR,
 			reg_addr,
 			I2C_MEMADD_SIZE_8BIT,
-			data,
+			(uint8_t*)data,
 			len,
 			EPC_TIMEOUT);
 

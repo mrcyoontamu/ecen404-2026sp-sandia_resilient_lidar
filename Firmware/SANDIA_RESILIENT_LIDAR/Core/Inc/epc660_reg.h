@@ -34,6 +34,9 @@
 #define EPC_REG_TEMP_BL					0x64
 #define EPC_REG_TEMP_BR					0x66
 
+// Clock timing
+#define EPC_REG_MOD_DIV					0x85
+
 
 
 //  AI GENERATED FOR REFERENCE

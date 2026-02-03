@@ -140,15 +140,21 @@ int main(void)
   /* USER CODE BEGIN 2 */
   DWT_Init();
 
-  uint32_t last_frame_tick = 0;
+//  uint32_t last_frame_tick = 0;
   uint32_t loop_tick = 0;
   uint32_t frame_timeout_ms = 1000;
+//
+//  float cpu_freq_mhz = (float)HAL_RCC_GetHCLKFreq() / 1000000.0f;
+//
+//  // Variables for timing
+//  uint32_t start_cycles, end_cycles, delta_cycles;
+//  float time_us;
 
-  float cpu_freq_mhz = (float)HAL_RCC_GetHCLKFreq() / 1000000.0f;
+  epc_status_t epcRET;
 
-  // Variables for timing
-  uint32_t start_cycles, end_cycles, delta_cycles;
-  float time_us;
+  epcRET = epc660_power_up();
+  HAL_Delay(5000);
+  epc660_power_down();
 
   /* USER CODE END 2 */
 
@@ -163,34 +169,12 @@ int main(void)
 		  loop_tick = HAL_GetTick();
 	  }
 
-// SOME OLD CODE TO TEST I2C AND USB
-//	  I2C_Scanner();
-//	  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-//	  static uint32_t counter = 0;
-//
-//	  // 1. Format the string directly into the Safe Buffer
-//	  // (This works safely because UserTxBufferHS is in the MPU protected area)
-//	  int len = sprintf((char *)UserTxBufferHS, "STM32 Alive! Count: %lu\r\n", counter++);
-//
-//	  // 2. Send the data
-//	  // We check if the USB is free (USBD_OK) before sending
-//	  if (CDC_Transmit_HS(UserTxBufferHS, len) == USBD_OK)
-//	  {
-//		  // Optional: Toggle an LED here to visualize successful transmission
-//		  // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-//	  }
-//	  else
-//	  {
-//		  // If USB was busy, we just skip this frame and try again next time
-//	  }
-//
-//	  // 3. Wait a bit so we don't flood the terminal
-//	  HAL_Delay(1000);
+	  USB_Transmit_Blocking((uint8_t*)"USB functional\r\n", (uint16_t)16);
+	  HAL_Delay(1000);
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
 	  // Feed the dog
 	  g_last_feed_time = HAL_GetTick();
   }
@@ -482,6 +466,10 @@ static void MX_GPIO_Init(void)
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
 {
+//	uint32_t start = HAL_GetTick();
+
+	if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED) return;
+
     USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceHS.pClassData;
 
     // Wait until previous transfer completes
@@ -558,6 +546,19 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+	HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+
+	if (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)
+	{
+	  uint32_t start = DWT->CYCCNT;
+	  /* ~100 ms delay: SystemCoreClock/10 cycles */
+	  uint32_t wait = SystemCoreClock / 10;
+	  while ((DWT->CYCCNT - start) < wait) { __NOP(); }
+	}
+	else
+	{
+	  for (volatile uint32_t i = 0; i < 2400000; ++i) { __NOP(); } /* adjust for speed */
+	}
   }
   /* USER CODE END Error_Handler_Debug */
 }

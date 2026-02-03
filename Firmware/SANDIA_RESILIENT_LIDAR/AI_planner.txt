@@ -1,0 +1,384 @@
+================================================================================
+                     EPC660 DRIVER IMPLEMENTATION PLANNER
+================================================================================
+Created: January 29, 2026
+Cross-referenced with: epc660 Datasheet V2.20
+
+This document outlines the implementation priority and order for the EPC660
+driver functions to achieve a Minimum Viable Product (MVP) - getting the first
+3D TOF image from the sensor.
+
+================================================================================
+                      PART 1: MINIMUM VIABLE PRODUCT (MVP)
+================================================================================
+
+The MVP goal is: Power up -> Initialize -> Configure -> Trigger -> Capture
+
+CRITICAL FUNCTIONS FOR MVP (in order of dependency):
+--------------------------------------------------------------------------------
+
+TIER 1 - ABSOLUTE ESSENTIALS (Must have for ANY functionality)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. epc660_power_up()                    [epc660.c]         ✓ IMPLEMENTED
+   - Powers on in correct sequence: +1.8V -> +5V/+10V -> -10V -> release RESET
+   - Datasheet reference: Section 5.6.1, Figure 21
+   - Status: Already implemented
+
+2. epc660_init()                        [epc660.c]         ☐ TODO - PRIORITY 1
+   - Verify chip ID (0x01 should return 0x06 for EPC660)
+   - Check EEPROM->CFG copy complete (0x7E bit 0 == 1)
+   - Load pixel sequencer code (calls epc660_sequencer_load)
+   - Apply startup defaults per Table 22:
+     * 0x90 bit 3 = 1 (LED preheat)
+     * 0xAB = 0x01 (LED preheat timing)
+     * 0xAE = 0x04 (manual DLL enable)
+   - Datasheet reference: Section 11.1.1, Table 22
+
+3. epc660_load_sequencer()              [epc660.c]         ☐ TODO - PRIORITY 2
+   - Wrapper for epc660_sequencer_load() which is already implemented
+   - Writes 157 rows of sequencer code to RAM starting at 0x80
+   - Datasheet reference: Section 15.11, 15.12
+
+
+TIER 2 - CONFIGURATION ESSENTIALS (Minimum config for a valid image)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+4. epc660_cfg_set_measurement_mode()    [epc660_config.c]  ☐ TODO - PRIORITY 3
+   - Write 0x92 = 0x34 for 4-DCS TOF mode (default, best accuracy)
+   - Datasheet reference: Section 9.1, Table 24
+   - Simple I2C write: epc_i2c_write(0x92, mode, EPC_DIRECT)
+
+5. epc660_cfg_set_modulation_divider()  [epc660_config.c]  ☐ TODO - PRIORITY 4
+   - Write 0x85 = divider (default 0x01 for 12MHz, 12.5m range)
+   - Datasheet reference: Table 20
+   - Simple I2C write
+
+6. epc660_cfg_set_integration_time_raw() [epc660_config.c] ☐ TODO - PRIORITY 5
+   - Write 0xA0:A1 (multiplier) and 0xA2:A3 (base count)
+   - Typical: 100us = multiplier=1, base_count=4799 (0x12BF)
+   - Datasheet reference: Section 11.4, Table 29
+
+
+TIER 3 - TRIGGER & CAPTURE (Getting actual data)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+7. epc660_trigger_single_measurement()  [epc660.c]         ☐ TODO - PRIORITY 6
+   - Write 0xA4 = 0x01 to trigger SW shutter
+   - Bit auto-clears after triggering
+   - Datasheet reference: Section 6.2.1
+
+8. epc660_trigger_hw_shutter()          [epc660.c]         ☐ TODO - PRIORITY 7
+   - Pulse SHUTTER GPIO high for >=250ns
+   - Faster than SW shutter by ~26us
+   - Datasheet reference: Section 6.2.1
+
+9. epc660_capture_frame()               [epc660.c]         ☐ TODO - PRIORITY 8
+   - MCU-SPECIFIC: Requires DCMI/DMA or GPIO parallel capture
+   - Capture 320x240 x 12-bit pixels per DCS frame
+   - For 4-DCS: need to capture 4 frames total
+   - Datasheet reference: Section 6
+
+
+================================================================================
+                      PART 2: IMPLEMENTATION ORDER
+================================================================================
+
+PHASE 1: BRING-UP (Get basic I2C communication working)
+--------------------------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+1.1    epc660_read_reg                   epc660.c          15 min
+1.2    epc660_write_reg                  epc660.c          15 min
+1.3    epc660_get_id                     epc660.c          30 min
+1.4    epc660_get_status                 epc660.c          15 min
+
+TEST CHECKPOINT 1: Power up chip, read ID, verify it returns 0x06
+
+
+PHASE 2: INITIALIZATION (Complete init sequence)
+-------------------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+2.1    epc660_load_sequencer             epc660.c          15 min
+       (wrapper for epc660_sequencer_load which exists)
+2.2    epc660_init                       epc660.c          1 hour
+       - Read chip ID
+       - Wait for EEPROM->CFG ready
+       - Load sequencer
+       - Apply Table 22 defaults
+
+TEST CHECKPOINT 2: Full init sequence completes without error
+
+
+PHASE 3: BASIC CONFIGURATION (Set up for 4-DCS capture)
+--------------------------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+3.1    epc660_cfg_set_modulation_divider epc660_config.c   30 min
+3.2    epc660_cfg_set_integration_time_raw epc660_config.c 30 min
+3.3    epc660_cfg_set_measurement_mode   epc660_config.c   30 min
+
+TEST CHECKPOINT 3: Can configure chip, read back registers to verify
+
+
+PHASE 4: TCMI CONFIGURATION (Set up parallel output)
+-----------------------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+4.1    epc660_cfg_set_tcmi_format        epc660_config.c   30 min
+4.2    epc660_cfg_set_dclk_freq          epc660_config.c   30 min
+4.3    epc660_cfg_set_tcmi_polarity      epc660_config.c   30 min
+
+TEST CHECKPOINT 4: TCMI signals visible on oscilloscope/logic analyzer
+
+
+PHASE 5: TRIGGER & CAPTURE (First image!)
+------------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+5.1    epc660_trigger_single_measurement epc660.c          30 min
+5.2    epc660_trigger_hw_shutter         epc660.c          30 min
+5.3    epc660_capture_frame              epc660.c          4-8 hours
+       (MCU-specific DCMI/DMA implementation)
+
+TEST CHECKPOINT 5: Raw DCS frame data captured in memory!
+
+
+PHASE 6: EXTENDED FEATURES (After MVP)
+--------------------------------------
+Order  Function                          File              Est. Time
+-----  --------------------------------  ----------------  ---------
+6.1    epc660_cfg_set_integration_time_us epc660_config.c  1 hour
+6.2    epc660_cfg_set_roi                epc660_config.c   1 hour
+6.3    epc660_cfg_set_binning            epc660_config.c   30 min
+6.4    epc660_cfg_set_led_output         epc660_config.c   30 min
+6.5    epc660_cfg_set_led_preheat        epc660_config.c   30 min
+6.6    Temperature sensor functions      epc660_config.c   2 hours
+6.7    EEPROM read/write                 epc660.c          1 hour
+
+
+================================================================================
+                      PART 3: MVP PSEUDOCODE FRAMEWORK
+================================================================================
+
+This is the complete code flow to capture your first image:
+
+--------------------------------------------------------------------------------
+STEP 1: POWER UP (already implemented)
+--------------------------------------------------------------------------------
+```c
+epc_status_t status;
+
+// Power up the chip
+status = epc660_power_up();
+if (status != EPC_OK) {
+    // Handle power-up failure
+    error_handler();
+}
+```
+
+--------------------------------------------------------------------------------
+STEP 2: INITIALIZE
+--------------------------------------------------------------------------------
+```c
+// Full initialization
+status = epc660_init();
+if (status != EPC_OK) {
+    // Handle init failure
+    error_handler();
+}
+
+// Internally, epc660_init() does:
+// 1. Read 0x01, verify chip_id == 0x06
+// 2. Poll 0x7E until bit 0 == 1 (EEPROM->CFG complete)
+// 3. Call epc660_sequencer_load() to write sequencer RAM
+// 4. Write 0x90 |= 0x08 (LED preheat enable)
+// 5. Write 0xAB = 0x01 (preheat timing)
+// 6. Write 0xAE = 0x04 (manual DLL enable)
+// 7. Write 0x3A = 0x30 (differential readout with ABS)
+```
+
+--------------------------------------------------------------------------------
+STEP 3: CONFIGURE FOR 4-DCS TOF
+--------------------------------------------------------------------------------
+```c
+// Set modulation frequency (12MHz = 12.5m range)
+epc660_cfg_set_modulation_divider(0x01);  // 0x85 = 0x01
+
+// Set integration time (100us example)
+// tINT = (0x01+1)/96MHz * (4799+1) * 1 = 100us
+epc660_cfg_set_integration_time_raw(1, 4799);  // 0xA0:A1=1, 0xA2:A3=4799
+
+// Set 4-DCS TOF mode
+epc660_cfg_set_measurement_mode(EPC_MODE_4DCS_TOF);  // 0x92 = 0x34
+
+// Configure TCMI output (adjust for your MCU's DCMI)
+epc660_cfg_set_tcmi_format(EPC_TCMI_12BIT);  // 0xCB = 0x00
+epc660_cfg_set_dclk_freq(EPC_DCLK_24MHZ);    // 0x89 = 0x04
+epc660_cfg_set_tcmi_polarity(1, 1, 1, 0);    // 0xCC: VSYNC/HSYNC/DCLK active high
+```
+
+--------------------------------------------------------------------------------
+STEP 4: PREPARE CAPTURE BUFFER
+--------------------------------------------------------------------------------
+```c
+// Calculate buffer size
+// 4-DCS mode: 4 frames x 320 x 240 pixels x 2 bytes = 614,400 bytes
+#define FRAME_WIDTH   320
+#define FRAME_HEIGHT  240
+#define BYTES_PER_PIXEL 2
+#define NUM_DCS_FRAMES  4
+
+uint16_t dcs_buffer[NUM_DCS_FRAMES][FRAME_HEIGHT][FRAME_WIDTH];
+// Or flat: uint16_t dcs_buffer[NUM_DCS_FRAMES * FRAME_HEIGHT * FRAME_WIDTH];
+
+// Configure DCMI/DMA to write to this buffer
+// (MCU-specific - see STM32 HAL DCMI examples)
+```
+
+--------------------------------------------------------------------------------
+STEP 5: CAPTURE LOOP (for 4-DCS)
+--------------------------------------------------------------------------------
+```c
+// 4-DCS mode captures 4 frames automatically with one trigger
+// But you need to capture each VSYNC-delimited frame
+
+for (int dcs = 0; dcs < 4; dcs++) {
+    // Wait for DCMI ready
+    // Configure DMA destination for this DCS frame
+    HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, 
+                       (uint32_t)&dcs_buffer[dcs][0][0],
+                       FRAME_WIDTH * FRAME_HEIGHT / 2);  // 32-bit transfers
+    
+    // Trigger measurement (only on first DCS, chip auto-advances)
+    if (dcs == 0) {
+        epc660_trigger_hw_shutter();  // Faster
+        // OR: epc660_trigger_single_measurement();
+    }
+    
+    // Wait for VSYNC/frame complete
+    // (Use DCMI interrupt or poll flag)
+    while (!frame_complete_flag) {
+        // Wait...
+    }
+    frame_complete_flag = 0;
+    
+    HAL_DCMI_Stop(&hdcmi);
+}
+```
+
+--------------------------------------------------------------------------------
+STEP 6: CALCULATE DISTANCE (Post-processing, not in driver)
+--------------------------------------------------------------------------------
+```c
+// For each pixel (x, y):
+for (int y = 0; y < FRAME_HEIGHT; y++) {
+    for (int x = 0; x < FRAME_WIDTH; x++) {
+        int16_t dcs0 = (int16_t)dcs_buffer[0][y][x];
+        int16_t dcs1 = (int16_t)dcs_buffer[1][y][x];
+        int16_t dcs2 = (int16_t)dcs_buffer[2][y][x];
+        int16_t dcs3 = (int16_t)dcs_buffer[3][y][x];
+        
+        // Phase calculation (datasheet eq. 2)
+        float phase = atan2f((float)(dcs3 - dcs1), (float)(dcs2 - dcs0));
+        phase = phase + M_PI;  // Shift to 0..2π range
+        
+        // Distance calculation
+        // c = 299792458 m/s, fLED = 12MHz
+        // D = c / (2 * 2π * fLED) * phase
+        float distance_m = (299792458.0f / (2.0f * 2.0f * M_PI * 12e6f)) * phase;
+        
+        // distance_m is now in meters, range 0 to 12.5m (unambiguity)
+        distance_map[y][x] = distance_m;
+    }
+}
+```
+
+
+================================================================================
+                      PART 4: FUNCTION PRIORITY SUMMARY
+================================================================================
+
+PRIORITY 1 (CRITICAL - MVP BLOCKERS):
+-------------------------------------
+☐ epc660_init()                         - Without this, chip won't work
+☐ epc660_read_reg()                     - Basic I2C read
+☐ epc660_write_reg()                    - Basic I2C write
+☐ epc660_load_sequencer()               - Wrapper for existing function
+☐ epc660_cfg_set_measurement_mode()     - Select 4-DCS mode
+☐ epc660_cfg_set_modulation_divider()   - Set modulation frequency
+☐ epc660_cfg_set_integration_time_raw() - Set exposure time
+☐ epc660_trigger_single_measurement()   - Start acquisition
+☐ epc660_capture_frame()                - Get the data (MCU-specific)
+
+PRIORITY 2 (IMPORTANT - Better MVP):
+------------------------------------
+☐ epc660_trigger_hw_shutter()           - Faster trigger
+☐ epc660_get_id()                       - Verify chip identity
+☐ epc660_get_status()                   - Check ready state
+☐ epc660_cfg_set_tcmi_format()          - Configure output format
+☐ epc660_cfg_set_dclk_freq()            - Configure output clock
+☐ epc660_cfg_set_tcmi_polarity()        - Match DCMI settings
+
+PRIORITY 3 (NICE TO HAVE - Enhanced Features):
+----------------------------------------------
+☐ epc660_cfg_set_integration_time_us()  - Human-readable timing
+☐ epc660_cfg_set_roi()                  - Reduce data/increase fps
+☐ epc660_cfg_set_binning()              - Increase sensitivity
+☐ epc660_cfg_set_auto_run()             - Continuous mode
+☐ epc660_cfg_set_led_output()           - LED driver config
+☐ epc660_cfg_set_led_preheat()          - Better ambient rejection
+
+PRIORITY 4 (ADVANCED - Optimization):
+-------------------------------------
+☐ epc660_cfg_set_dual_phase_mode()      - Motion blur reduction
+☐ epc660_cfg_set_dual_integration_mode() - HDR mode
+☐ epc660_cfg_set_dll_*()                - Phase calibration
+☐ epc660_cfg_temp_*()                   - Temperature compensation
+☐ epc660_cfg_set_rolling_mode()         - Max frame rate (158fps)
+☐ epc660_soft_reset()                   - Recovery
+☐ epc660_read_eeprom/write_eeprom()     - Calibration storage
+☐ epc660_load_calibration()             - Factory cal restore
+
+
+================================================================================
+                      PART 5: ESTIMATED TIMELINE
+================================================================================
+
+Phase 1 (Bring-up):           ~1.5 hours
+Phase 2 (Initialization):     ~1.5 hours
+Phase 3 (Basic Config):       ~1.5 hours
+Phase 4 (TCMI Config):        ~1.5 hours
+Phase 5 (Trigger & Capture):  ~5-9 hours (DCMI is the wildcard)
+----------------------------------------
+TOTAL FOR MVP:                ~11-15 hours
+
+Phase 6 (Extended):           ~6-8 hours
+----------------------------------------
+TOTAL FOR COMPLETE DRIVER:    ~17-23 hours
+
+
+================================================================================
+                      PART 6: KEY DATASHEET REFERENCES
+================================================================================
+
+Section 5.6   - Power-up and reset sequence (Figure 21)
+Section 6     - TCMI interface (parallel data output)
+Section 6.2   - Single/continuous measurement control
+Section 6.4   - TCMI data format (12-bit, 8-bit modes)
+Section 9.1   - Distance measurement (3D TOF)
+Section 9.2   - Distance calculation algorithm
+Section 11.1  - Start-up and initialization sequence (Table 22)
+Section 11.2  - Image acquisition
+Section 11.4  - Integration time setting (Table 29)
+Section 15.11 - Pixel sequencer code write procedure
+Section 15.12 - Pixel sequencer code (157 rows)
+Table 20      - Unambiguity range vs modulation clock
+Table 22      - Additional register settings during startup
+Table 24      - Register settings for DCS mode
+
+
+================================================================================
+                              END OF PLANNER
+================================================================================
