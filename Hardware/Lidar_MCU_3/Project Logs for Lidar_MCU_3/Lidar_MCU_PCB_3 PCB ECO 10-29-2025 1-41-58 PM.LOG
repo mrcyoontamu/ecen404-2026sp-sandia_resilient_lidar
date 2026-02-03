@@ -1,0 +1,39 @@
+Added Component: Designator=CR2(SOD882_STM)
+Add component (AddParameter): Name = "Copyright"; Value = "Copyright (C) 2025 Ultra Librarian. All rights reserved."; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Manufacturer_Name"; Value = "STMicroelectronics"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Manufacturer_Part_Number"; Value = "ESDALC6V1-1M2"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "RefDes"; Value = "RefDes"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Type"; Value = "Type"; VariantName = "[No Variations]"
+Added Component: Designator=CR4(SOD882_STM)
+Add component (AddParameter): Name = "Copyright"; Value = "Copyright (C) 2025 Ultra Librarian. All rights reserved."; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Manufacturer_Name"; Value = "STMicroelectronics"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Manufacturer_Part_Number"; Value = "ESDALC6V1-1M2"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "RefDes"; Value = "RefDes"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Type"; Value = "Type"; VariantName = "[No Variations]"
+Added Component: Designator=J3(AMPHENOL_10129381-912001BLF)
+Add component (AddParameter): Name = "Check_prices"; Value = "https://www.snapeda.com/parts/10129381-912001BLF/Amphenol+FCI/view-part/?ref=eda"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Digi-Key_Part_Number"; Value = "10129381-912001BLF-ND"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "MF"; Value = "Amphenol ICC (FCI)"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "MP"; Value = "10129381-912001BLF"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Package"; Value = "None"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Purchase-URL"; Value = "https://pricing.snapeda.com/search/part/10129381-912001BLF/?ref=eda"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "SnapEDA_Link"; Value = "https://www.snapeda.com/parts/10129381-912001BLF/Amphenol+FCI/view-part/?ref=snap"; VariantName = "[No Variations]"
+Add component (AddParameter): Name = "Value"; Value = ""; VariantName = "[No Variations]"
+Added Pin To Net: NetName=USB_FS_ID Pin=CR2-1
+Added Pin To Net: NetName=GND Pin=CR2-2
+Added Pin To Net: NetName=NRST Pin=CR4-1
+Added Pin To Net: NetName=GND Pin=CR4-2
+Added Pin To Net: NetName=3V3 Pin=J3-01
+Added Pin To Net: NetName=GPIO_0 Pin=J3-02
+Added Pin To Net: NetName=DEBUG_SWDIO Pin=J3-03
+Added Pin To Net: NetName=GPIO_1 Pin=J3-04
+Added Pin To Net: NetName=DEBUG_SWCLK Pin=J3-05
+Added Pin To Net: NetName=GPIO_2 Pin=J3-06
+Added Pin To Net: NetName=DEBUG_SWO Pin=J3-07
+Added Pin To Net: NetName=GPIO_3 Pin=J3-08
+Added Pin To Net: NetName=NRST Pin=J3-09
+Added Pin To Net: NetName=GND Pin=J3-10
+Added Pin To Net: NetName=BOOT0 Pin=J3-11
+Added Member To Class: ClassName=USB Member=Component CR2 ESDALC6V1-1M2
+Added Member To Class: ClassName=MCU Member=Component CR4 ESDALC6V1-1M2
+Added Member To Class: ClassName=Communications Member=Component J3 10129381-912001BLF
