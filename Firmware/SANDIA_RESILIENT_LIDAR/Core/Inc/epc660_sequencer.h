@@ -11,5 +11,6 @@
 #include "epc660_platform.h"
 
 epc_status_t epc660_sequencer_load(void);
+epc_status_t epc660_sequencer_readback(void);
 
 #endif /* INC_EPC660_SEQUENCER_H_ */

@@ -198,3 +198,80 @@ epc_status_t epc660_sequencer_load(void)
 
 	return EPC_OK;
 }
+
+epc_status_t epc660_sequencer_readback(void)
+{
+	/*
+	 * Reads back the sequencer RAM and compares against the expected
+	 * sequencer_code array. Per datasheet section 15.13:
+	 *   1. Disable acquisition (0xA4 = 0x00)
+	 *   2. Stop sequencer (0x91 = 0x00)
+	 *   3. For each RAM address:
+	 *      - Write address to 0x40
+	 *      - Write 0x09 to 0x47 (enable RAM read access)
+	 *      - Read Data0..Data5 from 0x41..0x46
+	 *   4. Disable RAM access (0x47 = 0x00)
+	 *   5. Restart sequencer (0x91 = 0x03)
+	 *
+	 * Returns EPC_OK if all bytes match, EPC_ERR if mismatch found.
+	 */
+
+	epc_status_t status;
+	uint8_t read_data[6];
+	uint32_t total_rows = sizeof(sequencer_code) / sizeof(sequencer_code[0]);
+
+	/* 1. Disable acquisition */
+	if ((status = epc_i2c_write(0xA4, 0x00, EPC_DIRECT)) != EPC_OK) return status;
+
+	/* 2. Stop sequencer */
+	if ((status = epc_i2c_write(0x91, 0x00, EPC_DIRECT)) != EPC_OK) return status;
+
+	/* 3. Read back each RAM address and compare */
+	for (uint32_t i = 0; i < total_rows; i++)
+	{
+		uint8_t ram_addr = sequencer_code[i][0];  /* First byte is RAM address */
+
+		/* Write RAM address to register 0x40 */
+		if ((status = epc_i2c_write(0x40, ram_addr, EPC_DIRECT)) != EPC_OK)
+		{
+			goto cleanup;
+		}
+
+		/* Enable RAM read access (0x09 per datasheet) */
+		if ((status = epc_i2c_write(0x47, 0x09, EPC_DIRECT)) != EPC_OK)
+		{
+			goto cleanup;
+		}
+
+		/* Read Data0..Data5 from registers 0x41..0x46 */
+		for (uint8_t j = 0; j < 6; j++)
+		{
+			if ((status = epc_i2c_read(0x41 + j, &read_data[j], EPC_DIRECT)) != EPC_OK)
+			{
+				goto cleanup;
+			}
+		}
+
+		/* Compare against expected values (bytes 1-6 of sequencer_code row) */
+		for (uint8_t j = 0; j < 6; j++)
+		{
+			if (read_data[j] != sequencer_code[i][j + 1])
+			{
+				/* Mismatch found */
+				status = EPC_ERR;
+				goto cleanup;
+			}
+		}
+	}
+
+	status = EPC_OK;
+
+cleanup:
+	/* 4. Disable RAM access */
+	epc_i2c_write(0x47, 0x00, EPC_DIRECT);
+
+	/* 5. Restart sequencer */
+	epc_i2c_write(0x91, 0x03, EPC_DIRECT);
+
+	return status;
+}

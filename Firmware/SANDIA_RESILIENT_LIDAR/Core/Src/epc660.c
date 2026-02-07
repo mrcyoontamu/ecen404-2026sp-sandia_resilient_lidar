@@ -8,6 +8,7 @@
 // INCLUDES
 #include "epc660.h"
 #include "epc660_reg.h"
+#include "epc660_sequencer.h"
 #include "epc660_platform.h"
 
 // DEFINES
@@ -25,8 +26,8 @@ epc_status_t epc660_power_up(void)
 	epc_delay_ms(5);
 
 	// Digital power
-	epc_power_1v8_3v3_set(1);
-	epc_delay_ms(10);
+	// epc_power_1v8_3v3_set(1);
+	// epc_delay_ms(10);
 
 	// Analog power
 	epc_power_5v_10v_set(1);
@@ -92,7 +93,7 @@ void epc_emergency_power_down(void)
 
 	// Analog power
 	epc_power_5v_10v_set(0);
-	epc_emergency_delay(2400000);
+	epc_emergency_delay(240000000);
 
 	// Digital power
 	epc_power_1v8_3v3_set(0);
@@ -148,10 +149,10 @@ epc_status_t epc660_init(void)
 	epc_status_t status;
 
 	uint8_t chip_id = 0;
-	if ((status = epc_i2c_read(EPC_REG_IC_TYPE, &chip_id, EPC_DIRECT)) != EPC_OK) {
+	if ((status = epc_i2c_read(0xFA, &chip_id, EPC_INDIRECT)) != EPC_OK) {
 		return status;
 	}
-	if (chip_id != 0x06) {
+	if (chip_id != 0x02) {
 		return EPC_ERR_ID;
 	}
 
@@ -174,6 +175,7 @@ epc_status_t epc660_init(void)
 	if ((status = epc660_sequencer_load()) != EPC_OK) {
 		return status;
 	}
+	if ((status = epc660_sequencer_readback()) != EPC_OK) return status;
 
 	// Enable LED pre-heat (3rd bit of reg 0x90 to 1 then 0xAB to 0x01)
 	uint8_t reg_val = 0;

@@ -34,6 +34,8 @@ void epc_power_5v_10v_set(int state);
 void epc_power_neg10v_set(int state);
 void epc_power_15v_set(int state);
 
+void epc_timer_init(void);
+void epc_delay_us(uint32_t us);
 void epc_delay_ms(uint32_t ms);
 void epc_emergency_delay(uint32_t loop_count);
 

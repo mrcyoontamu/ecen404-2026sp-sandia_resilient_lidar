@@ -31,6 +31,7 @@
 #include "core_cm7.h"
 
 #include "epc660.h"
+#include "epc660_platform.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,8 +85,6 @@ static void MX_DCMI_Init(void);
 void I2C_Scanner(void);
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
-
-void DWT_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -135,10 +134,10 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C2_Init();
-  MX_USB_DEVICE_Init();
+  //MX_USB_DEVICE_Init();
   MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
-  DWT_Init();
+  epc_timer_init();
 
 //  uint32_t last_frame_tick = 0;
   uint32_t loop_tick = 0;
@@ -153,7 +152,7 @@ int main(void)
   epc_status_t epcRET;
 
   epcRET = epc660_power_up();
-  HAL_Delay(5000);
+  epc660_init();
   epc660_power_down();
 
   /* USER CODE END 2 */
@@ -169,8 +168,7 @@ int main(void)
 		  loop_tick = HAL_GetTick();
 	  }
 
-	  USB_Transmit_Blocking((uint8_t*)"USB functional\r\n", (uint16_t)16);
-	  HAL_Delay(1000);
+//	  USB_Transmit_Blocking((uint8_t*)"USB functional\r\n", (uint16_t)16);
 
     /* USER CODE END WHILE */
 
@@ -338,7 +336,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
@@ -409,12 +407,22 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : BUTTON_Pin */
+  GPIO_InitStruct.Pin = BUTTON_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(BUTTON_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pin : LED2_Pin */
   GPIO_InitStruct.Pin = LED2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LED2_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(BUTTON_EXTI_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(BUTTON_EXTI_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -425,44 +433,30 @@ static void MX_GPIO_Init(void)
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
-//void I2C_Scanner(void)
-//{
-//    char msg[64];
-//    HAL_UART_Transmit(&huart6, (uint8_t*)"Scanning I2C bus...\r\n", 21, 100);
-//
-//    HAL_StatusTypeDef result;
-//    uint8_t i;
-//    int count = 0;
-//
-//    for (i = 1; i < 128; i++)
-//    {
-//        /*
-//         * HAL_I2C_IsDeviceReady checks if a device acknowledges an address.
-//         * Params:
-//         * 1. I2C Handle (&hi2c1)
-//         * 2. Device Address (shifted left by 1)
-//         * 3. Number of trials (1 is usually enough)
-//         * 4. Timeout in ms (10ms)
-//         */
-//        result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(i << 1), 1, 10);
-//
-//        if (result == HAL_OK)
-//        {
-//            sprintf(msg, "I2C device found at address: 0x%02X\r\n", i);
-//            HAL_UART_Transmit(&huart6, (uint8_t*)msg, strlen(msg), 100);
-//            count++;
-//        }
-//    }
-//
-//    if (count == 0)
-//    {
-//        HAL_UART_Transmit(&huart6, (uint8_t*)"No I2C devices found.\r\n", 25, 100);
-//    }
-//    else
-//    {
-//        HAL_UART_Transmit(&huart6, (uint8_t*)"Scan Complete.\r\n", 16, 100);
-//    }
-//}
+void I2C_Scanner(void)
+{
+
+    HAL_StatusTypeDef result;
+    uint8_t i;
+
+    for (i = 1; i < 128; i++)
+    {
+        /*
+         * HAL_I2C_IsDeviceReady checks if a device acknowledges an address.
+         * Params:
+         * 1. I2C Handle (&hi2c1)
+         * 2. Device Address (shifted left by 1)
+         * 3. Number of trials (1 is usually enough)
+         * 4. Timeout in ms (10ms)
+         */
+        result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(i << 1), 1, 10);
+
+        if (result == HAL_OK)
+        {
+        	HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+        }
+    }
+}
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
 {
@@ -488,17 +482,10 @@ static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
     }
 }
 
-void DWT_Init(void)
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk))
-  {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  }
-  if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk))
-  {
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-  }
-  DWT->CYCCNT = 0;
+    /* Check if the interrupt came from BUTTON */
+    if (GPIO_Pin == BUTTON_Pin) Error_Handler();
 }
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/

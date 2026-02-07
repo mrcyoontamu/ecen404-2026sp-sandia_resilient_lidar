@@ -149,6 +149,26 @@ void epc_power_15v_set(int state)
 
 
 // TIME FUNCTIONS
+void epc_timer_init(void)
+{
+  if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk))
+  {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  }
+  if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk))
+  {
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  }
+  DWT->CYCCNT = 0;
+}
+
+void epc_delay_us(uint32_t us)
+{
+	uint32_t start_tick = DWT->CYCCNT;
+	uint32_t ticks = us * (SystemCoreClock / 1000000);
+	while ((DWT->CYCCNT - start_tick) < ticks);
+}
+
 void epc_delay_ms(uint32_t ms)
 {
 	HAL_Delay(ms);

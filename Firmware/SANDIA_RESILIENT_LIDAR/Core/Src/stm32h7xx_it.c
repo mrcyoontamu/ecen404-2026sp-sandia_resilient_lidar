@@ -72,7 +72,7 @@ extern DCMI_HandleTypeDef hdcmi;
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+	Error_Handler();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)
@@ -87,7 +87,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-  epc_emergency_power_down();
+	Error_Handler();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -102,7 +102,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+	  Error_Handler();
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -117,7 +117,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+	  Error_Handler();
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -132,7 +132,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+	  Error_Handler();
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {
@@ -192,22 +192,22 @@ void SysTick_Handler(void)
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
   // WATCHDOG LOGIC
-  uint32_t current_time = HAL_GetTick();
-
-  // Calculate difference
-  uint32_t diff;
-  if (current_time >= g_last_feed_time)
-  {
-      diff = current_time - g_last_feed_time;
-  }
-  else	// Wrap-around logic
-  {
-      diff = 0;
+  // 1. DEBUGGER CHECK (The "Magic" Fix)
+  // This register bit tells us if a debugger (ST-Link) is currently halting the core.
+  // If attached, we SKIP the watchdog logic entirely.
+  if (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) {
+      // Optional: Update feed time so it doesn't trigger immediately upon disconnect
+      g_last_feed_time = HAL_GetTick();
+      return;
   }
 
-  if (diff > 100000)	// Currently set to 100 seconds, probably should be decreased later
+  // 2. SAFETY LOGIC
+  // Simple subtraction handles uint32 wrap-around automatically.
+  // We use a tight 500ms window to catch freezes quickly.
+  if ((HAL_GetTick() - g_last_feed_time) > 5000)
   {
-      Error_Handler();
+	  //Error_Handler();
+      HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
   }
   /* USER CODE END SysTick_IRQn 1 */
 }
@@ -231,6 +231,20 @@ void DMA1_Stream0_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
 
   /* USER CODE END DMA1_Stream0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI line[15:10] interrupts.
+  */
+void EXTI15_10_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI15_10_IRQn 0 */
+
+  /* USER CODE END EXTI15_10_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(BUTTON_Pin);
+  /* USER CODE BEGIN EXTI15_10_IRQn 1 */
+
+  /* USER CODE END EXTI15_10_IRQn 1 */
 }
 
 /**
