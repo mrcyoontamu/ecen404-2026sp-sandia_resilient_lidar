@@ -16,9 +16,14 @@
 #define EPC_REG_IC_VERSION				0x01
 #define EPC_CHIP_ID_EXPECTED			0x02
 
-#define EPC_REG_MODE_CONTROL			0xA4
-#define EPC_REG_INT_TIME_LOW			0xA2	// Integration time low bit
-#define EPC_REG_INT_TIME_HIGH			0xA3	// Integration time high bit
+#define EPC_REG_GRAYSCALE_MODE_CTRL		0x3C
+#define EPC_REG_SHUTTER_CTRL			0xA4
+
+// Integration time
+#define EPC_REG_INT_MULT_LOW			0xA0
+#define EPC_REG_INT_MULT_HIGH			0xA1
+#define EPC_REG_INT_BASE_LOW			0xA2	// Integration time low bit
+#define EPC_REG_INT_BASE_HIGH			0xA3	// Integration time high bit
 
 // EEPROM stuff
 #define EPC_REG_RAM_PAGE				0x80
@@ -36,6 +41,10 @@
 
 // Clock timing
 #define EPC_REG_MOD_DIV					0x85
+#define EPC_REG_DCLK_CTRL				0x89
+
+// Measurement mode
+#define EPC_REG_MEASUREMENT_MODE		0x92
 
 
 

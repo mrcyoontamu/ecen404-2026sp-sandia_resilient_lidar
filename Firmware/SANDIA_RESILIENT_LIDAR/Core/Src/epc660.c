@@ -100,20 +100,6 @@ void epc_emergency_power_down(void)
 	epc_emergency_delay(2400000);
 }
 
-/* ===== AI-GENERATED BLOCK START ===== */
-/*
- * -----------------------------------------------------------------------------
- * STUB IMPLEMENTATIONS FOR EPC660 HIGH-LEVEL FUNCTIONS
- *
- * Each function below contains:
- *   1. A high-level description of what the function should do
- *   2. A pseudocode section outlining the implementation steps
- *   3. A simple return statement for compilation
- *
- * Replace the return statements with actual implementation code.
- * -----------------------------------------------------------------------------
- */
-
 epc_status_t epc660_init(void)
 {
 	/*
@@ -199,7 +185,7 @@ epc_status_t epc660_init(void)
 
 
 	// GRAYSCALE CONFIGURATIONS
-	// Set grayscale mode for ABS
+	// Set grayscale mode for ABS (This setting can persist even during 4 DCS)
 	if (epc_i2c_write(0x3A, 0x30, EPC_DIRECT) != EPC_OK) {
 		return EPC_ERR;
 	}
@@ -294,7 +280,7 @@ epc_status_t epc660_trigger_single_measurement(void)
 	return EPC_OK;
 }
 
-epc_status_t epc660_trigger_hw_shutter(void)
+void epc660_trigger_hw_shutter(void)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -320,8 +306,9 @@ epc_status_t epc660_trigger_hw_shutter(void)
 	 * NOTE: For continuous mode, keep SHUTTER high during the last
 	 *       row pair readout of each frame. See datasheet section 6.2.2.
 	 */
-
-	return EPC_OK;
+	epc_shutter_pin_set(1);
+	epc_delay_us(1);
+	epc_shutter_pin_set(0);
 }
 
 epc_status_t epc660_get_status(uint8_t *status_out)
@@ -607,5 +594,5 @@ epc_status_t epc660_load_calibration(void)
 
 	return EPC_OK;
 }
-/* ===== AI-GENERATED BLOCK END ===== */
+
 

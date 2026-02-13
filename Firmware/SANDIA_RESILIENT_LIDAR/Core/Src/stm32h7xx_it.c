@@ -204,7 +204,7 @@ void SysTick_Handler(void)
   // 2. SAFETY LOGIC
   // Simple subtraction handles uint32 wrap-around automatically.
   // We use a tight 500ms window to catch freezes quickly.
-  if ((HAL_GetTick() - g_last_feed_time) > 5000)
+  if ((HAL_GetTick() - g_last_feed_time) > 10000)
   {
 	  //Error_Handler();
       HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);

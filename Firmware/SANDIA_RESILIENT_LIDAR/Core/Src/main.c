@@ -32,6 +32,7 @@
 
 #include "epc660.h"
 #include "epc660_platform.h"
+#include "epc660_config.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,6 +44,8 @@
 /* USER CODE BEGIN PD */
 #define IMG_WIDTH 320
 #define IMG_HEIGHT 240
+#define SINGLE_FRAME_SIZE (IMG_WIDTH * IMG_HEIGHT)
+#define NUM_FRAMES 4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,11 +63,31 @@ I2C_HandleTypeDef hi2c2;
 /* USER CODE BEGIN PV */
 extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
-uint16_t frame_buffer[IMG_WIDTH*IMG_HEIGHT];
+uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES];
+
+// One buffer to reference frame angles
+uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE];
+
+// One buffer for current frame angles
+uint16_t current_angle_buffer[SINGLE_FRAME_SIZE];
 
 // A "flag" to signal when a frame is ready to be sent
 volatile uint8_t frame_ready = 0;
+
+// Pointers to the start of each frame
+uint16_t* p_frame1 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 0];
+uint16_t* p_frame2 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 1];
+uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
+uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
+
+static const uint32_t k_dcmi_dma_length = (SINGLE_FRAME_SIZE * NUM_FRAMES) / 2;
+
+volatile uint8_t all_frames_ready = 0;
+volatile uint32_t frame_capture_count = 0;
+
+extern USBD_HandleTypeDef hUsbDeviceHS;
 
 // Some timer variables to be used with DWT
 volatile uint32_t tDCMI_start, tDCMI_end;
@@ -134,26 +157,52 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C2_Init();
-  //MX_USB_DEVICE_Init();
+  MX_USB_DEVICE_Init();
   MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
+
+  // This is a replacement of DWT_init
   epc_timer_init();
 
-//  uint32_t last_frame_tick = 0;
+  // TODO: Should be removed from this section
   uint32_t loop_tick = 0;
-  uint32_t frame_timeout_ms = 1000;
-//
-//  float cpu_freq_mhz = (float)HAL_RCC_GetHCLKFreq() / 1000000.0f;
-//
-//  // Variables for timing
-//  uint32_t start_cycles, end_cycles, delta_cycles;
-//  float time_us;
+  uint32_t frame_timeout_ms = 5000;
 
+
+  // Initialize epc660
   epc_status_t epcRET;
 
-  epcRET = epc660_power_up();
-  epc660_init();
-  epc660_power_down();
+  // Disable USB interrupt during power-up to prevent spurious triggers
+  // from EMI/voltage transients on the 10V/neg10V rails coupling into USB lines
+  HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
+
+  if (epc660_power_up() != EPC_OK) Error_Handler();
+  if (epc660_init() != EPC_OK) Error_Handler();
+  //epc660_power_down();
+
+  // Clear any pending USB interrupt flags that accumulated, then re-enable
+  __HAL_PCD_CLEAR_FLAG(&hpcd_USB_OTG_HS, 0xFFFFFFFF);
+  NVIC_ClearPendingIRQ(OTG_HS_IRQn);
+  HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
+
+  all_frames_ready = 0;
+  frame_capture_count = 0;
+
+  const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
+
+  // Start capture (testing purposes)
+  epc660_cfg_set_measurement_mode(EPC_MODE_GRAYSCALE);
+  epc_i2c_write(0x3C, 0x26, EPC_DIRECT);	// No illumination
+  epc660_cfg_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
+  epc_i2c_write(0x91, 0x43, EPC_DIRECT);	//Hsync stretching
+
+  // Read back some settings for sanity check
+  uint8_t reg_readback = 0;
+  epcRET = epc_i2c_read(0xCC, &reg_readback, EPC_DIRECT);
+
+  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
+  epc660_trigger_hw_shutter();
+  //epc_i2c_write(0xA4, 0x01, EPC_DIRECT);	// Trigger SW Shutter
 
   /* USER CODE END 2 */
 
@@ -166,8 +215,39 @@ int main(void)
 	  {
 		  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
 		  loop_tick = HAL_GetTick();
+		  epc660_trigger_hw_shutter();
 	  }
 
+	  if (all_frames_ready == 1)
+	  {
+		  all_frames_ready = 0;
+		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, SINGLE_FRAME_SIZE * NUM_FRAMES * 2);
+
+	        while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);
+
+	        USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
+
+	        uint8_t* p_buffer = (uint8_t*)p_frame1;
+	        uint32_t bytes_remaining = SINGLE_FRAME_SIZE;
+	        uint16_t chunk_size;
+
+	        while (bytes_remaining > 0)
+	        {
+	          if (bytes_remaining > 65535)
+	          {
+	            chunk_size = 65535;
+	          }
+	          else
+	          {
+	            chunk_size = (uint16_t)bytes_remaining;
+	          }
+
+	          USB_Transmit_Blocking(p_buffer, chunk_size);
+	          p_buffer += chunk_size;
+	          bytes_remaining -= chunk_size;
+	        }
+	        HAL_Delay(1000);
+	  }
 //	  USB_Transmit_Blocking((uint8_t*)"USB functional\r\n", (uint16_t)16);
 
     /* USER CODE END WHILE */
@@ -257,8 +337,8 @@ static void MX_DCMI_Init(void)
   /* USER CODE END DCMI_Init 1 */
   hdcmi.Instance = DCMI;
   hdcmi.Init.SynchroMode = DCMI_SYNCHRO_HARDWARE;
-  hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_RISING;
-  hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
+  hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_FALLING;
+  hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_LOW;
   hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_LOW;
   hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
   hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_12B;
@@ -433,6 +513,17 @@ static void MX_GPIO_Init(void)
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
+void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
+{
+  frame_capture_count++;
+
+  if (frame_capture_count >= 1)
+  {
+//	  HAL_DCMI_Stop(hdcmi);
+	  all_frames_ready = 1;
+	  frame_capture_count = 0;
+  }
+}
 void I2C_Scanner(void)
 {
 
@@ -473,7 +564,7 @@ static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
     }
 
     // Queue new transfer
-    CDC_Transmit_HS(Buf, Len);
+    if (CDC_Transmit_HS(Buf, Len) != USBD_OK) return;
 
     // Wait until this one completes
     while (hcdc->TxState != 0)

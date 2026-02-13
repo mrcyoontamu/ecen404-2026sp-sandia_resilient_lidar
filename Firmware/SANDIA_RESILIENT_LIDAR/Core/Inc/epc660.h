@@ -80,7 +80,7 @@ epc_status_t epc660_trigger_single_measurement(void);
  *
  * @return EPC_OK on success.
  */
-epc_status_t epc660_trigger_hw_shutter(void);
+void epc660_trigger_hw_shutter(void);
 
 /**
  * @brief Read current status/ready flags from the device.

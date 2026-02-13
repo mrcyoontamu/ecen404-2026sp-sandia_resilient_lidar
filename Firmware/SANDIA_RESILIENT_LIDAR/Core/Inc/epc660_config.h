@@ -23,6 +23,7 @@
  *
  * Defines DCS acquisition modes per datasheet section 9.1 and 11.2.
  */
+// TODO: NEEDS ATTENTION, register 0x92 is quite complicated
 typedef enum {
     EPC_MODE_4DCS_TOF       = 0x34,  /**< 4-DCS TOF mode (default, best accuracy) */
     EPC_MODE_2DCS_TOF       = 0x1C,  /**< 2-DCS TOF mode (faster, higher noise) */
@@ -88,29 +89,18 @@ typedef enum {
 } epc_col_reduction_t;
 
 /**
- * @brief TCMI data format (register 0xCB).
- *
- * Per datasheet section 6.4.
- */
-typedef enum {
-    EPC_TCMI_12BIT       = 0x00, /**< 12-bit mode, all DATA[11:0] used */
-    EPC_TCMI_8BIT_MSB    = 0x01, /**< 8-bit mode, DATA[11:4] only */
-    EPC_TCMI_MSB_LSB     = 0x02, /**< 8-bit split: MSB first, LSB second */
-    EPC_TCMI_LSB_MSB     = 0x03  /**< 8-bit split: LSB first, MSB second */
-} epc_tcmi_format_t;
-
-/**
  * @brief DCLK frequency divider (register 0x89).
  *
  * PLL output (96MHz) divided to get DCLK.
  */
 typedef enum {
-    EPC_DCLK_48MHZ = 0x02, /**< 96/2 = 48MHz (max) */
-    EPC_DCLK_32MHZ = 0x03, /**< 96/3 = 32MHz */
-    EPC_DCLK_24MHZ = 0x04, /**< 96/4 = 24MHz (default) */
-    EPC_DCLK_19MHZ = 0x05, /**< 96/5 = 19.2MHz */
-    EPC_DCLK_16MHZ = 0x06, /**< 96/6 = 16MHz */
-    EPC_DCLK_12MHZ = 0x08  /**< 96/8 = 12MHz */
+    EPC_DCLK_48MHZ = 0x01, /**< 96/2 = 48MHz (max) */
+    EPC_DCLK_32MHZ = 0x02, /**< 96/3 = 32MHz */
+    EPC_DCLK_24MHZ = 0x03, /**< 96/4 = 24MHz (default) */
+    EPC_DCLK_16MHZ = 0x05, /**< 96/6 = 16MHz */
+    EPC_DCLK_12MHZ = 0x07,  /**< 96/8 = 12MHz */
+    EPC_DCLK_3MHZ = 0x1F  /**< 96/8 = 12MHz */
+
 } epc_dclk_freq_t;
 
 /*
@@ -408,10 +398,10 @@ epc_status_t epc660_cfg_set_dll_fine(uint16_t fine_value);
  *
  * Writes register 0xCB.
  *
- * @param format One of epc_tcmi_format_t values.
+ * @param format A two byte register value
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_tcmi_format(epc_tcmi_format_t format);
+epc_status_t epc660_cfg_set_tcmi_format(uint8_t format);
 
 /**
  * @brief Set TCMI DCLK frequency.

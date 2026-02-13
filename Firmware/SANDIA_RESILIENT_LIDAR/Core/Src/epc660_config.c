@@ -195,9 +195,13 @@ epc_status_t epc660_cfg_set_integration_time_raw(uint16_t multiplier, uint16_t b
 	 * 5. Return EPC_OK if all writes succeed
 	 */
 
-	(void)multiplier;
-	(void)base_count;
-	return EPC_OK;
+    uint8_t data[4];
+    data[0] = (uint8_t)(multiplier & 0xFF);        // A0 low
+    data[1] = (uint8_t)((multiplier >> 8) & 0xFF); // A1 high
+    data[2] = (uint8_t)(base_count & 0xFF);        // A2 low
+    data[3] = (uint8_t)((base_count >> 8) & 0xFF); // A3 high
+
+	return epc_i2c_write_multi(EPC_REG_INT_MULT_LOW, data, 4);
 }
 
 epc_status_t epc660_cfg_set_integration_time2_raw(uint16_t base_count)
@@ -223,9 +227,11 @@ epc_status_t epc660_cfg_set_integration_time2_raw(uint16_t base_count)
 	 *       mode is enabled via epc660_cfg_set_dual_integration_mode(1).
 	 *       The multiplier from 0xA0:A1 is shared with the secondary time.
 	 */
+	uint8_t data[2];
+    data[0] = (uint8_t)(base_count & 0xFF);        // A2 low
+    data[1] = (uint8_t)((base_count >> 8) & 0xFF); // A3 high
 
-	(void)base_count;
-	return EPC_OK;
+	return epc_i2c_write_multi(0x9E, data, 2);
 }
 
 /*
@@ -261,8 +267,8 @@ epc_status_t epc660_cfg_set_measurement_mode(epc_measurement_mode_t mode)
 	 *       Grayscale mode needs 0x3C set via epc660_cfg_set_grayscale_mode().
 	 *       Dual modes need 0x94 bit 7 set.
 	 */
-
-	(void)mode;
+	epc_status_t status;
+	if ((status = epc_i2c_write(EPC_REG_MEASUREMENT_MODE, (uint8_t)mode, EPC_DIRECT)) != EPC_OK) return status;
 	return EPC_OK;
 }
 
@@ -291,8 +297,7 @@ epc_status_t epc660_cfg_set_grayscale_mode(epc_grayscale_mode_t gs_mode)
 	 *       with special trim register settings.
 	 */
 
-	(void)gs_mode;
-	return EPC_OK;
+	return epc_i2c_write(EPC_REG_GRAYSCALE_MODE_CTRL, (uint8_t)gs_mode, EPC_DIRECT);
 }
 
 epc_status_t epc660_cfg_set_auto_run(uint8_t enable)
@@ -326,7 +331,19 @@ epc_status_t epc660_cfg_set_auto_run(uint8_t enable)
 	 *          enabling, otherwise frames may be lost.
 	 */
 
-	(void)enable;
+	epc_status_t status;
+	uint8_t reg_val;
+
+	// Read current shutter control
+	if ((status = epc_i2c_read(EPC_REG_SHUTTER_CTRL, &reg_val, EPC_DIRECT)) != EPC_OK) return status;
+
+	// Modify auto-run bit
+	if (enable) reg_val |= 0x02;
+	else 		reg_val &= ~0x02;
+
+	// Write back new shutter control
+	if ((status == epc_i2c_write(EPC_REG_SHUTTER_CTRL, reg_val, EPC_DIRECT)) != EPC_OK) return status;
+
 	return EPC_OK;
 }
 
@@ -789,7 +806,7 @@ epc_status_t epc660_cfg_set_dll_fine(uint16_t fine_value)
  * =============================================================================
  */
 
-epc_status_t epc660_cfg_set_tcmi_format(epc_tcmi_format_t format)
+epc_status_t epc660_cfg_set_tcmi_format(uint8_t format)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -805,18 +822,11 @@ epc_status_t epc660_cfg_set_tcmi_format(epc_tcmi_format_t format)
 	 *
 	 * 2. Return status from I2C write
 	 *
-	 * FORMAT OPTIONS:
-	 *   0x00 (12BIT):     All DATA[11:0] valid, 12 parallel lines needed
-	 *   0x01 (8BIT_MSB):  Only DATA[11:4] used, 8 parallel lines
-	 *   0x02 (MSB_LSB):   8-bit mode, MSB first then LSB (2 clocks/pixel)
-	 *   0x03 (LSB_MSB):   8-bit mode, LSB first then MSB (2 clocks/pixel)
-	 *
 	 * NOTE: STM32 DCMI typically works with 8-bit or 12-bit parallel.
 	 *       For 12-bit data on 8-bit DCMI, use MSB_LSB format.
 	 */
 
-	(void)format;
-	return EPC_OK;
+	return epc_i2c_write(0xCB, format, EPC_DIRECT);
 }
 
 epc_status_t epc660_cfg_set_dclk_freq(epc_dclk_freq_t freq)
@@ -837,20 +847,19 @@ epc_status_t epc660_cfg_set_dclk_freq(epc_dclk_freq_t freq)
 	 *
 	 * 3. Return EPC_OK on success
 	 *
-	 * FREQUENCY OPTIONS (96MHz PLL / divider):
-	 *   0x02 = 48MHz (fastest)
-	 *   0x03 = 32MHz
-	 *   0x04 = 24MHz (default)
-	 *   0x05 = 19.2MHz
-	 *   0x06 = 16MHz
-	 *   0x08 = 12MHz (HSYNC stretch recommended)
+	 * FREQUENCY OPTIONS (96MHz PLL / (divider + 1)):
+	 *   0x01 = 48MHz (fastest)
+	 *   0x02 = 32MHz
+	 *   0x03 = 24MHz (default)
+	 *   0x04 = 19.2MHz
+	 *   0x05 = 16MHz
+	 *   0x07 = 12MHz (HSYNC stretch recommended)
 	 *
 	 * NOTE: MCU's DCMI peripheral must support the selected frequency.
 	 *       Faster DCLK = higher frame rate but more demanding on MCU.
 	 */
 
-	(void)freq;
-	return EPC_OK;
+	return epc_i2c_write(EPC_REG_DCLK_CTRL, (uint8_t)freq, EPC_DIRECT);
 }
 
 epc_status_t epc660_cfg_set_tcmi_polarity(uint8_t vsync_active_high,

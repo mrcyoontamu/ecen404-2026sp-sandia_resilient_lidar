@@ -43,6 +43,7 @@
 /* USER CODE BEGIN PD */
 #define IMG_WIDTH 320
 #define IMG_HEIGHT 240
+#define NUM_FRAMES 4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,7 +62,13 @@ I2C_HandleTypeDef hi2c2;
 extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
-uint16_t frame_buffer[IMG_WIDTH*IMG_HEIGHT];
+uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES];
+
+// One buffer to reference frame angles
+uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE];
+
+// One buffer for current frame angles
+uint16_t current_angle_buffer[SINGLE_FRAME_SIZE];
 
 // A "flag" to signal when a frame is ready to be sent
 volatile uint8_t frame_ready = 0;
