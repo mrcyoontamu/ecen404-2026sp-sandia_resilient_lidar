@@ -16,7 +16,7 @@
 #define EPC_REG_IC_VERSION				0x01
 #define EPC_CHIP_ID_EXPECTED			0x02
 
-#define EPC_REG_GRAYSCALE_MODE_CTRL		0x3C
+#define EPC_REG_GRAYSCALE_MOD_CTRL		0x3C
 #define EPC_REG_SHUTTER_CTRL			0xA4
 
 // Integration time
@@ -45,6 +45,9 @@
 
 // Measurement mode
 #define EPC_REG_MEASUREMENT_MODE		0x92
+
+// TCMI settings
+#define EPC_REG_TCMI_POLARITY			0xCC
 
 
 

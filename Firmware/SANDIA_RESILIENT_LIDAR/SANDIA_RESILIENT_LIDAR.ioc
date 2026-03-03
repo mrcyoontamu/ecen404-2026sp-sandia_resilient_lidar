@@ -1,6 +1,6 @@
 #MicroXplorer Configuration settings - do not modify
-CAD.formats=
-CAD.pinconfig=
+CAD.formats=[]
+CAD.pinconfig=Dual
 CAD.provider=
 CORTEX_M7.AccessPermission_Spec=MPU_REGION_FULL_ACCESS
 CORTEX_M7.BaseAddress_Spec=0x30000000
@@ -11,10 +11,10 @@ CORTEX_M7.MPU_Control=MPU_PRIVILEGED_DEFAULT
 CORTEX_M7.Size_Spec=MPU_REGION_SIZE_4KB
 CORTEX_M7.SubRegionDisable_Spec=0x0
 CORTEX_M7.default_mode_Activation=1
-DCMI.HSPolarity=DCMI_HSPOLARITY_LOW
+DCMI.HSPolarity=DCMI_HSPOLARITY_HIGH
 DCMI.IPParameters=PCKPolarity,VSPolarity,HSPolarity
 DCMI.PCKPolarity=DCMI_PCKPOLARITY_FALLING
-DCMI.VSPolarity=DCMI_VSPOLARITY_LOW
+DCMI.VSPolarity=DCMI_VSPOLARITY_HIGH
 Dma.DCMI.0.Direction=DMA_PERIPH_TO_MEMORY
 Dma.DCMI.0.EventEnable=DISABLE
 Dma.DCMI.0.FIFOMode=DMA_FIFOMODE_DISABLE

@@ -46,6 +46,8 @@
 #define IMG_HEIGHT 240
 #define SINGLE_FRAME_SIZE (IMG_WIDTH * IMG_HEIGHT)
 #define NUM_FRAMES 4
+
+#define PHASE_TO_U16_SCALE (10430.378f)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,7 +67,7 @@ extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
 extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
-uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES];
+uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES] __attribute__((aligned(4)));
 
 // One buffer to reference frame angles
 uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE];
@@ -83,9 +85,11 @@ uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
 uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
 
 static const uint32_t k_dcmi_dma_length = (SINGLE_FRAME_SIZE * NUM_FRAMES) / 2;
+static const uint32_t k_dcmi_dma_length_grayscale = SINGLE_FRAME_SIZE / 2;
 
 volatile uint8_t all_frames_ready = 0;
 volatile uint32_t frame_capture_count = 0;
+volatile uint8_t camera_error_flag = 0;
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
@@ -105,9 +109,12 @@ static void MX_DMA_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_DCMI_Init(void);
 /* USER CODE BEGIN PFP */
-void I2C_Scanner(void);
 
+void I2C_Scanner(void);
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
+void calculate_depth_simple(void);
+
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -157,7 +164,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C2_Init();
-  MX_USB_DEVICE_Init();
+  //MX_USB_DEVICE_Init();
   MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
 
@@ -174,16 +181,17 @@ int main(void)
 
   // Disable USB interrupt during power-up to prevent spurious triggers
   // from EMI/voltage transients on the 10V/neg10V rails coupling into USB lines
-  HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
+  //HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
 
   if (epc660_power_up() != EPC_OK) Error_Handler();
+  MX_USB_DEVICE_Init();	// Try initializing USB here
   if (epc660_init() != EPC_OK) Error_Handler();
   //epc660_power_down();
 
   // Clear any pending USB interrupt flags that accumulated, then re-enable
-  __HAL_PCD_CLEAR_FLAG(&hpcd_USB_OTG_HS, 0xFFFFFFFF);
-  NVIC_ClearPendingIRQ(OTG_HS_IRQn);
-  HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
+  //__HAL_PCD_CLEAR_FLAG(&hpcd_USB_OTG_HS, 0xFFFFFFFF);
+  //NVIC_ClearPendingIRQ(OTG_HS_IRQn);
+  //HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
 
   all_frames_ready = 0;
   frame_capture_count = 0;
@@ -191,14 +199,19 @@ int main(void)
   const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
 
   // Start capture (testing purposes)
-  epc660_cfg_set_measurement_mode(EPC_MODE_GRAYSCALE);
-  epc_i2c_write(0x3C, 0x26, EPC_DIRECT);	// No illumination
-  epc660_cfg_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
-  epc_i2c_write(0x91, 0x43, EPC_DIRECT);	//Hsync stretching
+//  epc_set_measurement_mode(EPC_MODE_GRAYSCALE);
+//  epc_set_grayscale_mode(EPC_GS_AMBIENT_ONLY);	// No illumination
+//  epc_set_dclk_freq(EPC_DCLK_24MHZ);	// Slow Dclk speed
+//  epc_set_hsync_stretch(1);	//Hsync stretching
+//  epc660_cfg_set_integration_time_raw(1, 75);	// This sets an integration time of 1.58us as per the datasheet
+//  epc660_cfg_set_software_saturation_flag(1);
 
-  // Read back some settings for sanity check
-  uint8_t reg_readback = 0;
-  epcRET = epc_i2c_read(0xCC, &reg_readback, EPC_DIRECT);
+  epc_set_measurement_mode(EPC_MODE_4DCS_TOF);
+  epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
+  epc_set_hsync_stretch(1);	//Hsync stretching
+  epc660_cfg_set_modulation_divider(3);	// Explicitly set 6MHz modulation
+  epc660_cfg_set_integration_time_raw(1, 599);	// This sets an integration time of 1.58us as per the datasheet
+  epc660_cfg_set_software_saturation_flag(1);
 
   HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
   epc660_trigger_hw_shutter();
@@ -215,20 +228,21 @@ int main(void)
 	  {
 		  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
 		  loop_tick = HAL_GetTick();
-		  epc660_trigger_hw_shutter();
 	  }
 
 	  if (all_frames_ready == 1)
 	  {
 		  all_frames_ready = 0;
 		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, SINGLE_FRAME_SIZE * NUM_FRAMES * 2);
+		  calculate_depth_simple();
+		  SCB_CleanDCache_by_Addr((uint32_t*)current_angle_buffer, SINGLE_FRAME_SIZE * 2);
 
 	        while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);
 
 	        USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
 
-	        uint8_t* p_buffer = (uint8_t*)p_frame1;
-	        uint32_t bytes_remaining = SINGLE_FRAME_SIZE;
+	        uint8_t* p_buffer = (uint8_t*)current_angle_buffer;
+	        uint32_t bytes_remaining = SINGLE_FRAME_SIZE * 2;
 	        uint16_t chunk_size;
 
 	        while (bytes_remaining > 0)
@@ -246,14 +260,21 @@ int main(void)
 	          p_buffer += chunk_size;
 	          bytes_remaining -= chunk_size;
 	        }
-	        HAL_Delay(1000);
+	        HAL_DCMI_Stop(&hdcmi);
+	        HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
+	        epc660_trigger_hw_shutter();
 	  }
-//	  USB_Transmit_Blocking((uint8_t*)"USB functional\r\n", (uint16_t)16);
 
+	  if (camera_error_flag == 1)
+	  {
+		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
+		  epc660_trigger_hw_shutter();
+	      camera_error_flag = 0;
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  // Feed the dog
+	  // Feed the dog	TODO: Currently disabled, need to re-enable later
 	  g_last_feed_time = HAL_GetTick();
   }
   /* USER CODE END 3 */
@@ -338,8 +359,8 @@ static void MX_DCMI_Init(void)
   hdcmi.Instance = DCMI;
   hdcmi.Init.SynchroMode = DCMI_SYNCHRO_HARDWARE;
   hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_FALLING;
-  hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_LOW;
-  hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_LOW;
+  hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
+  hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_HIGH;
   hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
   hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_12B;
   hdcmi.Init.JPEGMode = DCMI_JPEG_DISABLE;
@@ -517,12 +538,47 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
   frame_capture_count++;
 
-  if (frame_capture_count >= 1)
+  if (frame_capture_count >= 4)
   {
-//	  HAL_DCMI_Stop(hdcmi);
+	  HAL_DCMI_Stop(hdcmi);
 	  all_frames_ready = 1;
 	  frame_capture_count = 0;
   }
+}
+void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
+{
+    // Make sure this interrupt came from our specific DCMI peripheral
+    if (hdcmi->Instance == DCMI)
+    {
+        uint32_t error_code = hdcmi->ErrorCode;
+
+        // 1. Overrun Error (Extremely common!)
+        // This means the camera sent data faster than the DMA could push it into RAM.
+        if (error_code & HAL_DCMI_ERROR_OVR)
+        {
+            // TODO: Handle overrun (e.g., print warning, flash RED LED)
+        }
+
+        // 2. Synchronization Error
+        // This means the DCMI detected a glitch or unexpected VSYNC/HSYNC pulse.
+        if (error_code & HAL_DCMI_ERROR_SYNC)
+        {
+            // TODO: Handle sync error
+        }
+
+        // 3. Timeout Error
+        // DCMI Timeout
+        if (error_code & HAL_DCMI_ERROR_TIMEOUT)
+        {
+            // TODO: Handle line error
+        }
+
+        // --- Master Reset ---
+        // If an error happens, the best way to recover is usually to stop the
+        // DCMI, clear the state, and get ready for a fresh capture.
+        HAL_DCMI_Stop(hdcmi);
+        camera_error_flag = 1;
+    }
 }
 void I2C_Scanner(void)
 {
@@ -570,6 +626,25 @@ static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
     while (hcdc->TxState != 0)
     {
         // Optionally add small delay for CPU efficiency
+    }
+}
+
+void calculate_depth_simple(void)
+{
+    for (int i = 0; i < (320 * 240); i++)
+    {
+        float i1 = (float)p_frame1[i];
+        float i2 = (float)p_frame2[i];
+        float i3 = (float)p_frame3[i];
+        float i4 = (float)p_frame4[i];
+
+        float Q = i1 - i3;
+        float I = i2 - i4;
+
+        float phase = atan2f(Q, I);
+        if (phase < 0) phase += 2.0f * M_PI;
+
+        current_angle_buffer[i] = (uint16_t)(phase * PHASE_TO_U16_SCALE);
     }
 }
 

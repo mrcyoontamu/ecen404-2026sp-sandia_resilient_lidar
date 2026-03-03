@@ -43,6 +43,7 @@
 /* USER CODE BEGIN PD */
 #define IMG_WIDTH 320
 #define IMG_HEIGHT 240
+#define SINGLE_FRAME_SIZE IMG_WIDTH * IMG_HEIGHT
 #define NUM_FRAMES 4
 /* USER CODE END PD */
 
@@ -165,13 +166,15 @@ int main(void)
   uint32_t start_cycles, end_cycles, delta_cycles;
   float time_us;
 
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
+  //HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  HAL_Delay(1000);
+	  usb_printf((char*)"USB Working!\r\n");
 	  // Blinking light to make sure main loop is still running
 	  if (HAL_GetTick() - loop_tick > frame_timeout_ms)
 	  {
@@ -198,7 +201,7 @@ int main(void)
 		  while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);	// Waiting loop
 
 		  USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
-		  uint8_t* p_buffer = (uint8_t*)frame_buffer;
+		  uint8_t* p_buffer = (uint8_t*)quad_frame_buffer;
 		  uint32_t bytes_remaining = 320 * 240 * 2; // 153,600
 		  uint16_t chunk_size;
 
@@ -224,7 +227,7 @@ int main(void)
 
 		  // Start our tDCMI counter
 		  tDCMI_start = DWT->CYCCNT;
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
+		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)quad_frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
 		  last_frame_tick = HAL_GetTick();
 	  }
 	  if (HAL_GetTick() - last_frame_tick > frame_timeout_ms)
@@ -233,7 +236,7 @@ int main(void)
 		  HAL_DCMI_DeInit(&hdcmi);
 		  MX_DCMI_Init(); // call your CubeMX-generated init function again
 
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
+		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)quad_frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
 		  last_frame_tick = HAL_GetTick();
 	  }
 // SOME OLD CODE TO TEST I2C AND USB

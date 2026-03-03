@@ -26,20 +26,25 @@ epc_status_t epc660_power_up(void)
 	epc_delay_ms(5);
 
 	// Digital power
-	// epc_power_1v8_3v3_set(1);
-	// epc_delay_ms(10);
+	epc_power_1v8_3v3_set(1);
+	epc_delay_ms(50);
 
 	// Analog power
 	epc_power_5v_10v_set(1);
-	epc_delay_ms(20);
+	epc_delay_ms(50);
 
 	// Negative bias
 	epc_power_neg10v_set(1);
-	epc_delay_ms(10);
+	epc_delay_ms(50);
+
+	// LED power
+	epc_power_15v_set(1);
+	epc_power_15v_set(0);
+	epc_delay_ms(50);
 
 	// Release reset
 	epc_reset_pin_set(1);
-	epc_delay_ms(5);
+	epc_delay_ms(20);
 
 	// Check if epc is alive
 	uint8_t chip_id = 0;
@@ -86,6 +91,10 @@ void epc_emergency_power_down(void)
 	epc_reset_pin_set(0);
 	epc_shutter_pin_set(0);
 	epc_emergency_delay(2400000);	// Very rough 10ms delay
+
+	// LED voltage
+	epc_power_15v_set(0);
+	epc_emergency_delay(2400000);
 
 	// Negative bias
 	epc_power_neg10v_set(0);

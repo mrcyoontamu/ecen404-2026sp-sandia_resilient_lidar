@@ -145,11 +145,14 @@ epc_status_t epc660_cfg_set_integration_time_us(uint16_t tint_us)
     }
 
     /* 3) Prefer small multiplier / large base_count: try multiplier=1..65535 */
+    /*    Constraint: (base_count + 1) must be divisible by 4 per datasheet */
     uint16_t selected_mult = 0;
     uint16_t selected_base = 0;
     for (uint32_t m = 1; m <= 65535; ++m) {
         uint32_t base_plus_one = (uint32_t)(P / (double)m + 0.5); // rounded
-        if (base_plus_one < 1) base_plus_one = 1;
+        /* Round to nearest multiple of 4 (integration length+1 must be div by 4) */
+        base_plus_one = ((base_plus_one + 2) / 4) * 4;
+        if (base_plus_one < 4) base_plus_one = 4;
         if (base_plus_one > 65536) continue;
         selected_mult = (uint16_t)m;
         selected_base = (uint16_t)(base_plus_one - 1u);
@@ -195,13 +198,16 @@ epc_status_t epc660_cfg_set_integration_time_raw(uint16_t multiplier, uint16_t b
 	 * 5. Return EPC_OK if all writes succeed
 	 */
 
-    uint8_t data[4];
-    data[0] = (uint8_t)(multiplier & 0xFF);        // A0 low
-    data[1] = (uint8_t)((multiplier >> 8) & 0xFF); // A1 high
-    data[2] = (uint8_t)(base_count & 0xFF);        // A2 low
-    data[3] = (uint8_t)((base_count >> 8) & 0xFF); // A3 high
+    epc_status_t status;
 
-	return epc_i2c_write_multi(EPC_REG_INT_MULT_LOW, data, 4);
+    // Write each register individually — multi-byte writes may not
+    // auto-increment on the EPC660 RAM page (0x80-0xEF).
+    if ((status = epc_i2c_write(0xA0, (uint8_t)(multiplier & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA1, (uint8_t)((multiplier >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA2, (uint8_t)(base_count & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA3, (uint8_t)((base_count >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+
+    return EPC_OK;
 }
 
 epc_status_t epc660_cfg_set_integration_time2_raw(uint16_t base_count)
@@ -240,7 +246,7 @@ epc_status_t epc660_cfg_set_integration_time2_raw(uint16_t base_count)
  * =============================================================================
  */
 
-epc_status_t epc660_cfg_set_measurement_mode(epc_measurement_mode_t mode)
+epc_status_t epc_set_measurement_mode(epc_measurement_mode_t mode)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -272,7 +278,7 @@ epc_status_t epc660_cfg_set_measurement_mode(epc_measurement_mode_t mode)
 	return EPC_OK;
 }
 
-epc_status_t epc660_cfg_set_grayscale_mode(epc_grayscale_mode_t gs_mode)
+epc_status_t epc_set_grayscale_mode(epc_grayscale_mode_t gs_mode)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -297,7 +303,7 @@ epc_status_t epc660_cfg_set_grayscale_mode(epc_grayscale_mode_t gs_mode)
 	 *       with special trim register settings.
 	 */
 
-	return epc_i2c_write(EPC_REG_GRAYSCALE_MODE_CTRL, (uint8_t)gs_mode, EPC_DIRECT);
+	return epc_i2c_write(EPC_REG_GRAYSCALE_MOD_CTRL, (uint8_t)gs_mode, EPC_DIRECT);
 }
 
 epc_status_t epc660_cfg_set_auto_run(uint8_t enable)
@@ -342,7 +348,7 @@ epc_status_t epc660_cfg_set_auto_run(uint8_t enable)
 	else 		reg_val &= ~0x02;
 
 	// Write back new shutter control
-	if ((status == epc_i2c_write(EPC_REG_SHUTTER_CTRL, reg_val, EPC_DIRECT)) != EPC_OK) return status;
+	if ((status = epc_i2c_write(EPC_REG_SHUTTER_CTRL, reg_val, EPC_DIRECT)) != EPC_OK) return status;
 
 	return EPC_OK;
 }
@@ -829,7 +835,7 @@ epc_status_t epc660_cfg_set_tcmi_format(uint8_t format)
 	return epc_i2c_write(0xCB, format, EPC_DIRECT);
 }
 
-epc_status_t epc660_cfg_set_dclk_freq(epc_dclk_freq_t freq)
+epc_status_t epc_set_dclk_freq(epc_dclk_freq_t freq)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -903,7 +909,7 @@ epc_status_t epc660_cfg_set_tcmi_polarity(uint8_t vsync_active_high,
 	return EPC_OK;
 }
 
-epc_status_t epc660_cfg_set_hsync_stretch(uint8_t enable)
+epc_status_t epc_set_hsync_stretch(uint8_t enable)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -931,8 +937,14 @@ epc_status_t epc660_cfg_set_hsync_stretch(uint8_t enable)
 	 *       Automatically enabled by epc660_cfg_set_dclk_freq() for slow clocks.
 	 */
 
-	(void)enable;
-	return EPC_OK;
+	if (enable)
+	{
+		return epc_i2c_write(0x91, 0x43, EPC_DIRECT);  // Enable HSYNC stretch
+	}
+	else
+	{
+		return epc_i2c_write(0x91, 0x03, EPC_DIRECT);  // Disable HSYNC stretch
+	}
 }
 
 /*
@@ -1164,7 +1176,7 @@ epc_status_t epc660_cfg_set_saturation_threshold(uint8_t threshold)
 	return EPC_OK;
 }
 
-epc_status_t epc660_cfg_set_saturation_output(uint8_t force_fff, uint8_t use_xsync)
+epc_status_t epc660_cfg_set_software_saturation_flag(uint8_t force_fff)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -1198,8 +1210,15 @@ epc_status_t epc660_cfg_set_saturation_output(uint8_t force_fff, uint8_t use_xsy
 	 *       without needing to monitor an extra GPIO pin.
 	 */
 
-	(void)force_fff;
-	(void)use_xsync;
+	epc_status_t status;
+	uint8_t reg_val;
+
+	if ((status = epc_i2c_read(EPC_REG_TCMI_POLARITY, &reg_val, EPC_DIRECT)) != EPC_OK) return status;
+
+	reg_val &= ~0x80;
+	if (force_fff)	reg_val |= 0x80;
+
+	if ((status = epc_i2c_write(EPC_REG_TCMI_POLARITY, reg_val, EPC_DIRECT)) != EPC_OK) return status;
 	return EPC_OK;
 }
 

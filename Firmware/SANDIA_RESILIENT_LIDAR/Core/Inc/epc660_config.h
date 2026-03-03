@@ -40,8 +40,8 @@ typedef enum {
  */
 typedef enum {
     EPC_GS_AMBIENT_ONLY          = 0x26, /**< Ambient light only, no LED */
-    EPC_GS_AMBIENT_DC_LED        = 0x16, /**< Ambient + non-modulated LED */
-    EPC_GS_AMBIENT_MODULATED_LED = 0x06  /**< Ambient + modulated LED */
+    EPC_GS_DC_LED        = 0x16, /**< Ambient + non-modulated LED */
+    EPC_GS_MODULATED_LED = 0x06  /**< Ambient + modulated LED */
 } epc_grayscale_mode_t;
 
 /**
@@ -176,7 +176,7 @@ epc_status_t epc660_cfg_set_integration_time2_raw(uint16_t base_count);
  * @param mode One of epc_measurement_mode_t values.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_measurement_mode(epc_measurement_mode_t mode);
+epc_status_t epc_set_measurement_mode(epc_measurement_mode_t mode);
 
 /**
  * @brief Configure grayscale sub-mode (LED on/off, modulated/DC).
@@ -186,7 +186,7 @@ epc_status_t epc660_cfg_set_measurement_mode(epc_measurement_mode_t mode);
  * @param gs_mode One of epc_grayscale_mode_t values.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_grayscale_mode(epc_grayscale_mode_t gs_mode);
+epc_status_t epc_set_grayscale_mode(epc_grayscale_mode_t gs_mode);
 
 /**
  * @brief Enable or disable continuous (auto-run) acquisition.
@@ -411,7 +411,7 @@ epc_status_t epc660_cfg_set_tcmi_format(uint8_t format);
  * @param freq One of epc_dclk_freq_t values.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_dclk_freq(epc_dclk_freq_t freq);
+epc_status_t epc_set_dclk_freq(epc_dclk_freq_t freq);
 
 /**
  * @brief Configure TCMI signal polarities.
@@ -442,7 +442,7 @@ epc_status_t epc660_cfg_set_tcmi_polarity(uint8_t vsync_active_high,
  * @param enable 1 to enable stretching, 0 to disable.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_hsync_stretch(uint8_t enable);
+epc_status_t epc_set_hsync_stretch(uint8_t enable);
 
 /*
  * -----------------------------------------------------------------------------
@@ -545,10 +545,9 @@ epc_status_t epc660_cfg_set_saturation_threshold(uint8_t threshold);
  * Writes register 0xCC bits 6-7.
  *
  * @param force_fff 1 to force 0xFFF on saturation, 0 for normal.
- * @param use_xsync 1 to output sat flag on XSYNC_SAT pin.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_saturation_output(uint8_t force_fff, uint8_t use_xsync);
+epc_status_t epc660_cfg_set_software_saturation_flag(uint8_t force_fff);
 
 /*
  * -----------------------------------------------------------------------------
