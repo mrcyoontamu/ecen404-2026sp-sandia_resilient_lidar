@@ -49,6 +49,8 @@
 // TCMI settings
 #define EPC_REG_TCMI_POLARITY			0xCC
 
+#define EPC_REG_SAT_THRESHOLD			0xAF
+
 
 
 //  AI GENERATED FOR REFERENCE

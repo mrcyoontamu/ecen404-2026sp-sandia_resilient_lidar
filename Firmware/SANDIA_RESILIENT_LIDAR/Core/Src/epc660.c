@@ -39,7 +39,6 @@ epc_status_t epc660_power_up(void)
 
 	// LED power
 	epc_power_15v_set(1);
-	epc_power_15v_set(0);
 	epc_delay_ms(50);
 
 	// Release reset

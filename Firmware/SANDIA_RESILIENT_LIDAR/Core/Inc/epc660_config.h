@@ -99,6 +99,7 @@ typedef enum {
     EPC_DCLK_24MHZ = 0x03, /**< 96/4 = 24MHz (default) */
     EPC_DCLK_16MHZ = 0x05, /**< 96/6 = 16MHz */
     EPC_DCLK_12MHZ = 0x07,  /**< 96/8 = 12MHz */
+	EPC_DCLK_6MHZ = 0x0F,  /**< 96/8 = 12MHz */
     EPC_DCLK_3MHZ = 0x1F  /**< 96/8 = 12MHz */
 
 } epc_dclk_freq_t;
@@ -124,7 +125,7 @@ typedef enum {
  * @param divider Divider value: 0=24MHz, 1=12MHz, 3=6MHz, 7=3MHz, 15=1.5MHz
  * @return EPC_OK on success, EPC_ERR_PARAM if invalid divider.
  */
-epc_status_t epc660_cfg_set_modulation_divider(uint8_t divider);
+epc_status_t epc_set_modulation_divider(uint8_t divider);
 
 /**
  * @brief Set integration time for TOF/grayscale measurements.
@@ -149,7 +150,7 @@ epc_status_t epc660_cfg_set_integration_time_us(uint16_t tint_us);
  * @param base_count 16-bit value for 0xA2:A3.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_integration_time_raw(uint16_t multiplier, uint16_t base_count);
+epc_status_t epc_set_integration_time_raw(uint16_t multiplier, uint16_t base_count);
 
 /**
  * @brief Set secondary integration time for dual-integration (HDR) mode.
@@ -547,7 +548,7 @@ epc_status_t epc660_cfg_set_saturation_threshold(uint8_t threshold);
  * @param force_fff 1 to force 0xFFF on saturation, 0 for normal.
  * @return EPC_OK on success.
  */
-epc_status_t epc660_cfg_set_software_saturation_flag(uint8_t force_fff);
+epc_status_t epc_set_software_saturation_flag(uint8_t force_fff);
 
 /*
  * -----------------------------------------------------------------------------

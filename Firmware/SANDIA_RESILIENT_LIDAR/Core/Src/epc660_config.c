@@ -41,7 +41,7 @@ static int16_t _temp_cal_offset[4] = {0}; // Calibration offsets for 4 sensors
  * =============================================================================
  */
 
-epc_status_t epc660_cfg_set_modulation_divider(uint8_t divider)
+epc_status_t epc_set_modulation_divider(uint8_t divider)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -74,7 +74,7 @@ epc_status_t epc660_cfg_set_modulation_divider(uint8_t divider)
 
 	/* Validate allowed divider values: 0, 1, 3, 7, 15 */
 	if (!(divider == 0 || divider == 1 || divider == 3 ||
-	      divider == 7 || divider == 15)) {
+	      divider == 7 || divider == 15) || divider == 31) {
 		return EPC_ERR_PARAM;
 	}
 	if ((status = epc_i2c_write(EPC_REG_MOD_DIV, divider, EPC_DIRECT)) != EPC_OK) {
@@ -172,7 +172,7 @@ epc_status_t epc660_cfg_set_integration_time_us(uint16_t tint_us)
     return EPC_OK;
 }
 
-epc_status_t epc660_cfg_set_integration_time_raw(uint16_t multiplier, uint16_t base_count)
+epc_status_t epc_set_integration_time_raw(uint16_t multiplier, uint16_t base_count)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:
@@ -202,10 +202,10 @@ epc_status_t epc660_cfg_set_integration_time_raw(uint16_t multiplier, uint16_t b
 
     // Write each register individually — multi-byte writes may not
     // auto-increment on the EPC660 RAM page (0x80-0xEF).
-    if ((status = epc_i2c_write(0xA0, (uint8_t)(multiplier & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA1, (uint8_t)((multiplier >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA2, (uint8_t)(base_count & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA3, (uint8_t)((base_count >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA1, (uint8_t)(multiplier & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA0, (uint8_t)((multiplier >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA3, (uint8_t)(base_count & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+    if ((status = epc_i2c_write(0xA2, (uint8_t)((base_count >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
 
     return EPC_OK;
 }
@@ -1176,7 +1176,7 @@ epc_status_t epc660_cfg_set_saturation_threshold(uint8_t threshold)
 	return EPC_OK;
 }
 
-epc_status_t epc660_cfg_set_software_saturation_flag(uint8_t force_fff)
+epc_status_t epc_set_software_saturation_flag(uint8_t force_fff)
 {
 	/*
 	 * HIGH-LEVEL DESCRIPTION:

@@ -38,6 +38,14 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum
+{
+  CAPTURE_4DCS = 0,
+  CAPTURE_2DCS,
+  CAPTURE_AMPLITUDE,
+  CAPTURE_GRAYSCALE
+} capture_types;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -63,17 +71,26 @@ DMA_HandleTypeDef hdma_dcmi;
 I2C_HandleTypeDef hi2c2;
 
 /* USER CODE BEGIN PV */
+
+/******************************* DEBUGGING TRIGGERS *******************************/
+volatile uint8_t trigger_debug = 0;
+volatile uint8_t trigger_amplitude = 0;
+/******************************* DEBUGGING TRIGGERS *******************************/
+
 extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
 extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
-uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES] __attribute__((aligned(4)));
+uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES] __attribute__((aligned(32)));
 
 // One buffer to reference frame angles
-uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE];
+uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
 
 // One buffer for current frame angles
-uint16_t current_angle_buffer[SINGLE_FRAME_SIZE];
+uint16_t current_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
+
+// Active buffer to transmit over USB (processed output or raw grayscale frame)
+uint16_t* current_output_buffer = current_angle_buffer;
 
 // A "flag" to signal when a frame is ready to be sent
 volatile uint8_t frame_ready = 0;
@@ -84,12 +101,26 @@ uint16_t* p_frame2 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 1];
 uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
 uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
 
+static const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
+
 static const uint32_t k_dcmi_dma_length = (SINGLE_FRAME_SIZE * NUM_FRAMES) / 2;
 static const uint32_t k_dcmi_dma_length_grayscale = SINGLE_FRAME_SIZE / 2;
+static uint32_t current_dcmi_dma_length = k_dcmi_dma_length;
+
 
 volatile uint8_t all_frames_ready = 0;
-volatile uint32_t frame_capture_count = 0;
+volatile capture_types current_capture_type = CAPTURE_GRAYSCALE;
 volatile uint8_t camera_error_flag = 0;
+volatile uint32_t saturated_pixel_count = 0;
+
+volatile uint32_t dbg_stats_valid_count = 0;
+volatile uint32_t dbg_stats_saturated_count = 0;
+volatile float dbg_mean_dcs0 = 0.0f;
+volatile float dbg_mean_dcs1 = 0.0f;
+volatile float dbg_mean_dcs2 = 0.0f;
+volatile float dbg_mean_dcs3 = 0.0f;
+volatile float dbg_mean_abs_i = 0.0f;
+volatile float dbg_mean_abs_q = 0.0f;
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
@@ -110,10 +141,16 @@ static void MX_I2C2_Init(void);
 static void MX_DCMI_Init(void);
 /* USER CODE BEGIN PFP */
 
-void I2C_Scanner(void);
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
+static void USB_Transmit_Frame(uint16_t* frame_pointer);
 void calculate_depth_simple(void);
+void calculate_amplitude_simple(void);
+void calculate_grayscale_simple(void);
 
+__attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS();
+__attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale();
+__attribute__((used, optimize("O0"))) epc_status_t testing_preset();
+__attribute__((used, optimize("O0"))) epc_status_t testing_preset2();
 
 /* USER CODE END PFP */
 
@@ -164,7 +201,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C2_Init();
-  //MX_USB_DEVICE_Init();
+//  MX_USB_DEVICE_Init();
   MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
 
@@ -175,18 +212,14 @@ int main(void)
   uint32_t loop_tick = 0;
   uint32_t frame_timeout_ms = 5000;
 
-
-  // Initialize epc660
-  epc_status_t epcRET;
-
   // Disable USB interrupt during power-up to prevent spurious triggers
   // from EMI/voltage transients on the 10V/neg10V rails coupling into USB lines
   //HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
 
   if (epc660_power_up() != EPC_OK) Error_Handler();
-  MX_USB_DEVICE_Init();	// Try initializing USB here
   if (epc660_init() != EPC_OK) Error_Handler();
-  //epc660_power_down();
+  MX_USB_DEVICE_Init();	// Try initializing USB here
+
 
   // Clear any pending USB interrupt flags that accumulated, then re-enable
   //__HAL_PCD_CLEAR_FLAG(&hpcd_USB_OTG_HS, 0xFFFFFFFF);
@@ -194,28 +227,45 @@ int main(void)
   //HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
 
   all_frames_ready = 0;
-  frame_capture_count = 0;
 
-  const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
+  epc_status_t preset_status = EPC_OK;
+  switch (current_capture_type)
+  {
+    case CAPTURE_4DCS:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
 
-  // Start capture (testing purposes)
-//  epc_set_measurement_mode(EPC_MODE_GRAYSCALE);
-//  epc_set_grayscale_mode(EPC_GS_AMBIENT_ONLY);	// No illumination
-//  epc_set_dclk_freq(EPC_DCLK_24MHZ);	// Slow Dclk speed
-//  epc_set_hsync_stretch(1);	//Hsync stretching
-//  epc660_cfg_set_integration_time_raw(1, 75);	// This sets an integration time of 1.58us as per the datasheet
-//  epc660_cfg_set_software_saturation_flag(1);
+    case CAPTURE_2DCS:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
 
-  epc_set_measurement_mode(EPC_MODE_4DCS_TOF);
-  epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
-  epc_set_hsync_stretch(1);	//Hsync stretching
-  epc660_cfg_set_modulation_divider(3);	// Explicitly set 6MHz modulation
-  epc660_cfg_set_integration_time_raw(1, 599);	// This sets an integration time of 1.58us as per the datasheet
-  epc660_cfg_set_software_saturation_flag(1);
+    case CAPTURE_AMPLITUDE:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
 
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
+    case CAPTURE_GRAYSCALE:
+      preset_status = default_preset_grayscale();
+      current_dcmi_dma_length = k_dcmi_dma_length_grayscale;
+      current_output_buffer = current_angle_buffer;
+      break;
+
+    default:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
+  }
+
+  if (preset_status != EPC_OK) Error_Handler();
+
+  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
   epc660_trigger_hw_shutter();
-  //epc_i2c_write(0xA4, 0x01, EPC_DIRECT);	// Trigger SW Shutter
 
   /* USER CODE END 2 */
 
@@ -233,41 +283,38 @@ int main(void)
 	  if (all_frames_ready == 1)
 	  {
 		  all_frames_ready = 0;
-		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, SINGLE_FRAME_SIZE * NUM_FRAMES * 2);
+      
+
+      // Process frames if necessary
+	  if (current_capture_type == CAPTURE_AMPLITUDE)
+	  {
+		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+		  calculate_amplitude_simple();
+		  SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
+	  }
+	  else if (current_capture_type == CAPTURE_4DCS)
+	  {
+		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
 		  calculate_depth_simple();
-		  SCB_CleanDCache_by_Addr((uint32_t*)current_angle_buffer, SINGLE_FRAME_SIZE * 2);
+		  SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
+	  }
+      else if (current_capture_type == CAPTURE_GRAYSCALE)
+      {
+        SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+        calculate_grayscale_simple();
+        SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
+      }
 
-	        while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);
+		  USB_Transmit_Frame(current_output_buffer);
 
-	        USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
-
-	        uint8_t* p_buffer = (uint8_t*)current_angle_buffer;
-	        uint32_t bytes_remaining = SINGLE_FRAME_SIZE * 2;
-	        uint16_t chunk_size;
-
-	        while (bytes_remaining > 0)
-	        {
-	          if (bytes_remaining > 65535)
-	          {
-	            chunk_size = 65535;
-	          }
-	          else
-	          {
-	            chunk_size = (uint16_t)bytes_remaining;
-	          }
-
-	          USB_Transmit_Blocking(p_buffer, chunk_size);
-	          p_buffer += chunk_size;
-	          bytes_remaining -= chunk_size;
-	        }
-	        HAL_DCMI_Stop(&hdcmi);
-	        HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
-	        epc660_trigger_hw_shutter();
+		  HAL_DCMI_Stop(&hdcmi);
+		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+		  epc660_trigger_hw_shutter();
 	  }
 
 	  if (camera_error_flag == 1)
 	  {
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, k_dcmi_dma_length);
+		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
 		  epc660_trigger_hw_shutter();
 	      camera_error_flag = 0;
 	  }
@@ -276,6 +323,12 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	  // Feed the dog	TODO: Currently disabled, need to re-enable later
 	  g_last_feed_time = HAL_GetTick();
+	  if (trigger_debug == 1)
+	  {
+		  default_preset_4DCS();
+		  default_preset_grayscale();
+		  testing_preset2();
+	  }
   }
   /* USER CODE END 3 */
 }
@@ -534,16 +587,26 @@ static void MX_GPIO_Init(void)
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
+//void HAL_DCMI_VsyncEventCallback(DCMI_HandleTypeDef *hdcmi)
+//{
+//  frame_capture_count++;
+//
+//  if (frame_capture_count >= 2)
+//  {
+//	  all_frames_ready = 2;
+//  }
+//
+//  if (frame_capture_count >= 4)
+//  {
+//	  HAL_DCMI_Stop(hdcmi);
+//	  all_frames_ready = 1;
+//	  frame_capture_count = 0;
+//  }
+//}
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
-  frame_capture_count++;
-
-  if (frame_capture_count >= 4)
-  {
-	  HAL_DCMI_Stop(hdcmi);
-	  all_frames_ready = 1;
-	  frame_capture_count = 0;
-  }
+  HAL_DCMI_Stop(hdcmi);
+  all_frames_ready = 1;
 }
 void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
 {
@@ -580,34 +643,11 @@ void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
         camera_error_flag = 1;
     }
 }
-void I2C_Scanner(void)
-{
-
-    HAL_StatusTypeDef result;
-    uint8_t i;
-
-    for (i = 1; i < 128; i++)
-    {
-        /*
-         * HAL_I2C_IsDeviceReady checks if a device acknowledges an address.
-         * Params:
-         * 1. I2C Handle (&hi2c1)
-         * 2. Device Address (shifted left by 1)
-         * 3. Number of trials (1 is usually enough)
-         * 4. Timeout in ms (10ms)
-         */
-        result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(i << 1), 1, 10);
-
-        if (result == HAL_OK)
-        {
-        	HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
-        }
-    }
-}
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
 {
-//	uint32_t start = HAL_GetTick();
+  const uint32_t usb_tx_timeout_ms = 1000;
+  uint32_t start = HAL_GetTick();
 
 	if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED) return;
 
@@ -616,36 +656,183 @@ static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
     // Wait until previous transfer completes
     while (hcdc->TxState != 0)
     {
-        // Optionally add a timeout here to avoid infinite lockup
+    	if ((HAL_GetTick() - start) > usb_tx_timeout_ms) return;
     }
 
     // Queue new transfer
     if (CDC_Transmit_HS(Buf, Len) != USBD_OK) return;
 
+    start = HAL_GetTick();
+
     // Wait until this one completes
     while (hcdc->TxState != 0)
     {
-        // Optionally add small delay for CPU efficiency
+    	if ((HAL_GetTick() - start) > usb_tx_timeout_ms) return;
     }
+}
+static void USB_Transmit_Frame(uint16_t* frame_pointer)
+{
+	while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);
+
+	USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
+
+	uint8_t* p_buffer = (uint8_t*)frame_pointer;
+	uint32_t bytes_remaining = SINGLE_FRAME_SIZE * 2;
+	uint16_t chunk_size;
+
+	while (bytes_remaining > 0)
+	{
+		if (bytes_remaining > 65535)
+		{
+			chunk_size = 65535;
+		}
+		else
+		{
+			chunk_size = (uint16_t)bytes_remaining;
+		}
+
+		USB_Transmit_Blocking(p_buffer, chunk_size);
+		p_buffer += chunk_size;
+		bytes_remaining -= chunk_size;
+	}
 }
 
 void calculate_depth_simple(void)
 {
-    for (int i = 0; i < (320 * 240); i++)
+  uint32_t saturated_count = 0;
+  for (int i = 0; i < (320 * 240); i++)
     {
-        float i1 = (float)p_frame1[i];
-        float i2 = (float)p_frame2[i];
-        float i3 = (float)p_frame3[i];
-        float i4 = (float)p_frame4[i];
+		uint16_t raw1 = (p_frame1[i] & 0x0FFF);
+		uint16_t raw2 = (p_frame2[i] & 0x0FFF);
+		uint16_t raw3 = (p_frame3[i] & 0x0FFF);
+		uint16_t raw4 = (p_frame4[i] & 0x0FFF);
 
-        float Q = i1 - i3;
-        float I = i2 - i4;
+		if ((raw1 == 0x0FFF) || (raw2 == 0x0FFF) || (raw3 == 0x0FFF) || (raw4 == 0x0FFF))
+		{
+			current_angle_buffer[i] = 0xFFFF;
+			saturated_count++;
+			continue;
+		}
 
-        float phase = atan2f(Q, I);
+		int16_t i1 = (int16_t)(raw1 - 2048);
+		int16_t i2 = (int16_t)(raw2 - 2048);
+		int16_t i3 = (int16_t)(raw3 - 2048);
+		int16_t i4 = (int16_t)(raw4 - 2048);
+
+        int16_t Q = i4 - i2;
+        int16_t I = i3 - i1;
+
+        float phase = atan2f((float)Q, (float)I);
         if (phase < 0) phase += 2.0f * M_PI;
 
         current_angle_buffer[i] = (uint16_t)(phase * PHASE_TO_U16_SCALE);
     }
+
+  saturated_pixel_count = saturated_count;
+}
+
+void calculate_amplitude_simple(void)
+{
+  uint32_t saturated_count = 0;
+  // For stats, delete later
+  uint64_t sum_dcs0 = 0;
+  uint64_t sum_dcs1 = 0;
+  uint64_t sum_dcs2 = 0;
+  uint64_t sum_dcs3 = 0;
+  uint64_t sum_abs_i = 0;
+  uint64_t sum_abs_q = 0;
+  uint32_t valid_count = 0;
+  // For stats, delete later
+  for (int i = 0; i < (320 * 240); i++)
+  {
+  uint16_t raw1 = (p_frame1[i] & 0x0FFF);
+  uint16_t raw2 = (p_frame2[i] & 0x0FFF);
+  uint16_t raw3 = (p_frame3[i] & 0x0FFF);
+  uint16_t raw4 = (p_frame4[i] & 0x0FFF);
+
+  if ((raw1 == 0x0FFF) || (raw2 == 0x0FFF) || (raw3 == 0x0FFF) || (raw4 == 0x0FFF))
+  {
+    current_angle_buffer[i] = 0xFFFF;
+    saturated_count++;
+    continue;
+  }
+
+  int16_t i1 = (int16_t)(raw1 - 2048);
+  int16_t i2 = (int16_t)(raw2 - 2048);
+  int16_t i3 = (int16_t)(raw3 - 2048);
+  int16_t i4 = (int16_t)(raw4 - 2048);
+
+  int32_t q = (int32_t)i4 - (int32_t)i2;
+  int32_t in_phase = (int32_t)i3 - (int32_t)i1;
+  // For stats, delete later
+  int32_t abs_i = (in_phase < 0) ? -in_phase : in_phase;
+  int32_t abs_q = (q < 0) ? -q : q;
+
+  sum_dcs0 += raw1;
+  sum_dcs1 += raw2;
+  sum_dcs2 += raw3;
+  sum_dcs3 += raw4;
+  sum_abs_i += (uint32_t)abs_i;
+  sum_abs_q += (uint32_t)abs_q;
+  valid_count++;
+  // For stats, delete later
+  float amplitude = 0.5f * sqrtf((float)(q * q + in_phase * in_phase));
+
+  if (amplitude > 65534.0f)
+  {
+    amplitude = 65534.0f;
+  }
+
+  current_angle_buffer[i] = (uint16_t)(amplitude + 0.5f);
+  }
+
+  saturated_pixel_count = saturated_count;
+  
+  // For stats, delete later
+  dbg_stats_valid_count = valid_count;
+  dbg_stats_saturated_count = saturated_count;
+
+  if (valid_count > 0)
+  {
+    float inv_valid = 1.0f / (float)valid_count;
+    dbg_mean_dcs0 = (float)sum_dcs0 * inv_valid;
+    dbg_mean_dcs1 = (float)sum_dcs1 * inv_valid;
+    dbg_mean_dcs2 = (float)sum_dcs2 * inv_valid;
+    dbg_mean_dcs3 = (float)sum_dcs3 * inv_valid;
+    dbg_mean_abs_i = (float)sum_abs_i * inv_valid;
+    dbg_mean_abs_q = (float)sum_abs_q * inv_valid;
+  }
+  else
+  {
+    dbg_mean_dcs0 = 0.0f;
+    dbg_mean_dcs1 = 0.0f;
+    dbg_mean_dcs2 = 0.0f;
+    dbg_mean_dcs3 = 0.0f;
+    dbg_mean_abs_i = 0.0f;
+    dbg_mean_abs_q = 0.0f;
+  }
+  // For stats, delete later
+}
+
+void calculate_grayscale_simple(void)
+{
+  uint32_t saturated_count = 0;
+
+  for (int i = 0; i < (320 * 240); i++)
+  {
+    uint16_t raw = (p_frame1[i] & 0x0FFF);
+
+    if (raw == 0x0FFF)
+    {
+      current_angle_buffer[i] = 0xFFFF;
+      saturated_count++;
+      continue;
+    }
+
+    current_angle_buffer[i] = raw;
+  }
+
+  saturated_pixel_count = saturated_count;
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -653,6 +840,79 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     /* Check if the interrupt came from BUTTON */
     if (GPIO_Pin == BUTTON_Pin) Error_Handler();
 }
+
+/* EPC660 CONFIG PRESETS */
+__attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS()
+{
+	__NOP();
+	volatile epc_status_t status;
+	epc_set_measurement_mode(EPC_MODE_4DCS_TOF);
+	epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
+	epc_set_hsync_stretch(1);	//Hsync stretching
+	status = epc_set_modulation_divider(3);	// Explicitly set 12MHz modulation
+	status = epc_set_integration_time_raw(1, 599);	// This sets an integration time of 1.58us as per the datasheet
+	epc_set_software_saturation_flag(1);
+
+	return EPC_OK;
+}
+__attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale()
+{
+	__NOP();
+	volatile epc_status_t status;
+	epc_set_measurement_mode(EPC_MODE_GRAYSCALE);
+	epc_set_grayscale_mode(EPC_GS_MODULATED_LED);	// No illumination
+	epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
+	if (epc_i2c_write(0x3A, 0x30, EPC_DIRECT) != EPC_OK) return EPC_ERR;	// Grayscale setting thing
+	epc_set_hsync_stretch(1);	//Hsync stretching
+	status = epc_set_integration_time_raw(1, 4799);	// This sets an integration time of #### as per the datasheet
+
+	return EPC_OK;
+}
+__attribute__((used, optimize("O0"))) epc_status_t testing_preset()
+{
+	epc_status_t status;
+	if ((status = epc_set_measurement_mode(EPC_MODE_4DCS_TOF)) != EPC_OK) return status;
+	if ((status = epc_set_dclk_freq(EPC_DCLK_12MHZ)) != EPC_OK) return status;	// Slow Dclk speed
+	if ((status = epc_set_hsync_stretch(1)) != EPC_OK) return status;	//Hsync stretching
+	if ((status = epc_set_modulation_divider(1)) != EPC_OK) return status;	// Explicitly set 6MHz modulation
+	if ((status = epc_set_integration_time_raw(1, 599)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
+	if ((status = epc_set_software_saturation_flag(1)) != EPC_OK) return status;
+
+	return EPC_OK;
+}
+__attribute__((used, optimize("O0"))) epc_status_t testing_preset2()
+{
+	epc_status_t status;
+	if ((status = epc_set_measurement_mode(EPC_MODE_4DCS_TOF)) != EPC_OK) return status;
+
+	if ((status = epc_set_dclk_freq(EPC_DCLK_24MHZ)) != EPC_OK) return status;	// Slow Dclk speed
+	if ((status = epc_set_dclk_freq(EPC_DCLK_12MHZ)) != EPC_OK) return status;
+	if ((status = epc_set_dclk_freq(EPC_DCLK_6MHZ)) != EPC_OK) return status;
+	if ((status = epc_set_dclk_freq(EPC_DCLK_3MHZ)) != EPC_OK) return status;
+
+	if ((status = epc_set_hsync_stretch(1)) != EPC_OK) return status;	//Hsync stretching
+	if ((status = epc_set_hsync_stretch(0)) != EPC_OK) return status;
+
+	if ((status = epc_set_modulation_divider(0)) != EPC_OK) return status;	// Explicitly set 6MHz modulation
+	if ((status = epc_set_modulation_divider(1)) != EPC_OK) return status;
+	if ((status = epc_set_modulation_divider(3)) != EPC_OK) return status;
+	if ((status = epc_set_modulation_divider(7)) != EPC_OK) return status;
+	if ((status = epc_set_modulation_divider(15)) != EPC_OK) return status;
+
+	if ((status = epc_set_integration_time_raw(1, 75)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
+	if ((status = epc_set_integration_time_raw(1, 599)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(1, 4799)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(1, 9599)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(1, 19199)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(1, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(2, 38399)) != EPC_OK) return status;
+
+	if ((status = epc_set_software_saturation_flag(1)) != EPC_OK) return status;
+	if ((status = epc_set_software_saturation_flag(0)) != EPC_OK) return status;
+
+	return EPC_OK;
+}
+
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
