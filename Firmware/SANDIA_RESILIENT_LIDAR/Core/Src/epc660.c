@@ -71,6 +71,10 @@ void epc660_power_down(void)
 	epc_shutter_pin_set(0);
 	epc_delay_ms(5);
 
+	// LED voltage
+	epc_power_15v_set(0);
+	epc_delay_ms(10);
+
 	// Negative bias
 	epc_power_neg10v_set(0);
 	epc_delay_ms(10);
@@ -198,10 +202,6 @@ epc_status_t epc660_init(void)
 		return EPC_ERR;
 	}
 
-//	// Ensures the chip is in ambient only mode (I should write this register in a separate function)
-//	if (epc_i2c_write(0x3C, 0x26, EPC_DIRECT) != EPC_OK) {
-//		return EPC_ERR;
-//	}
 	return EPC_OK;
 }
 

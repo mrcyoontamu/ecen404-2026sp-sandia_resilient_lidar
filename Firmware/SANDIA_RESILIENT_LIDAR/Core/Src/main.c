@@ -27,6 +27,8 @@
 #include <stdarg.h>
 
 #include "usbd_cdc_if.h"
+#include "usbd_core.h"
+#include "usbd_desc.h"
 
 #include "core_cm7.h"
 
@@ -46,6 +48,12 @@ typedef enum
   CAPTURE_GRAYSCALE
 } capture_types;
 
+typedef enum
+{
+  EPC660_POWER_ON = 0,
+  EPC660_POWER_OFF
+} epc660_power_state_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -56,6 +64,8 @@ typedef enum
 #define NUM_FRAMES 4
 
 #define PHASE_TO_U16_SCALE (10430.378f)
+#define BUTTON_DEBOUNCE_MS 150U
+#define POWER_OFF_BLINK_MS 100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,33 +83,33 @@ I2C_HandleTypeDef hi2c2;
 /* USER CODE BEGIN PV */
 
 /******************************* DEBUGGING TRIGGERS *******************************/
-volatile uint8_t trigger_debug = 0;
-volatile uint8_t trigger_amplitude = 0;
+static volatile uint8_t trigger_debug = 0;
+static volatile uint8_t trigger_amplitude = 0;
 /******************************* DEBUGGING TRIGGERS *******************************/
 
 extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
 extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
-uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES] __attribute__((aligned(32)));
+static uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES] __attribute__((aligned(32)));
 
 // One buffer to reference frame angles
-uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
+static uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
 
 // One buffer for current frame angles
-uint16_t current_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
+static uint16_t current_angle_buffer[SINGLE_FRAME_SIZE] __attribute__((aligned(32)));
 
 // Active buffer to transmit over USB (processed output or raw grayscale frame)
-uint16_t* current_output_buffer = current_angle_buffer;
+static uint16_t* current_output_buffer = current_angle_buffer;
 
 // A "flag" to signal when a frame is ready to be sent
-volatile uint8_t frame_ready = 0;
+static volatile uint8_t frame_ready = 0;
 
 // Pointers to the start of each frame
-uint16_t* p_frame1 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 0];
-uint16_t* p_frame2 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 1];
-uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
-uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
+static uint16_t* p_frame1 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 0];
+static uint16_t* p_frame2 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 1];
+static uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
+static uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
 
 static const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
 
@@ -108,24 +118,28 @@ static const uint32_t k_dcmi_dma_length_grayscale = SINGLE_FRAME_SIZE / 2;
 static uint32_t current_dcmi_dma_length = k_dcmi_dma_length;
 
 
-volatile uint8_t all_frames_ready = 0;
-volatile capture_types current_capture_type = CAPTURE_GRAYSCALE;
-volatile uint8_t camera_error_flag = 0;
-volatile uint32_t saturated_pixel_count = 0;
+static volatile uint8_t all_frames_ready = 0;
+static volatile capture_types current_capture_type = CAPTURE_4DCS;
+static volatile uint8_t dcmi_error_flag = 0;
+static volatile uint8_t reset_epc660_flag = 0;
+static volatile epc660_power_state_t epc660_power_state = EPC660_POWER_ON;
+static volatile uint8_t epc660_power_toggle_request = 0;
+static volatile uint32_t button_last_press_ms = 0;
+static volatile uint32_t saturated_pixel_count = 0;
 
-volatile uint32_t dbg_stats_valid_count = 0;
-volatile uint32_t dbg_stats_saturated_count = 0;
-volatile float dbg_mean_dcs0 = 0.0f;
-volatile float dbg_mean_dcs1 = 0.0f;
-volatile float dbg_mean_dcs2 = 0.0f;
-volatile float dbg_mean_dcs3 = 0.0f;
-volatile float dbg_mean_abs_i = 0.0f;
-volatile float dbg_mean_abs_q = 0.0f;
+static volatile uint32_t dbg_stats_valid_count = 0;
+static volatile uint32_t dbg_stats_saturated_count = 0;
+static volatile float dbg_mean_dcs0 = 0.0f;
+static volatile float dbg_mean_dcs1 = 0.0f;
+static volatile float dbg_mean_dcs2 = 0.0f;
+static volatile float dbg_mean_dcs3 = 0.0f;
+static volatile float dbg_mean_abs_i = 0.0f;
+static volatile float dbg_mean_abs_q = 0.0f;
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
 // Some timer variables to be used with DWT
-volatile uint32_t tDCMI_start, tDCMI_end;
+static volatile uint32_t tDCMI_start, tDCMI_end;
 
 // Watchdog counter
 volatile uint32_t g_last_feed_time = 0;
@@ -143,6 +157,15 @@ static void MX_DCMI_Init(void);
 
 static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
 static void USB_Transmit_Frame(uint16_t* frame_pointer);
+static void process_and_transmit_data(void);
+static void handle_dcmi_error(void);
+static epc_status_t apply_capture_preset(void);
+static void handle_epc660_reset(void);
+static void handle_epc660_power_toggle_request(void);
+static epc_status_t power_up_epc660_and_resume_capture(void);
+static void power_down_epc660(void);
+static void usb_stop_cleanly(void);
+static void usb_start_nonfatal(void);
 void calculate_depth_simple(void);
 void calculate_amplitude_simple(void);
 void calculate_grayscale_simple(void);
@@ -201,7 +224,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C2_Init();
-//  MX_USB_DEVICE_Init();
+  //MX_USB_DEVICE_Init();
   MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
 
@@ -216,9 +239,18 @@ int main(void)
   // from EMI/voltage transients on the 10V/neg10V rails coupling into USB lines
   //HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
 
-  if (epc660_power_up() != EPC_OK) Error_Handler();
-  if (epc660_init() != EPC_OK) Error_Handler();
-  MX_USB_DEVICE_Init();	// Try initializing USB here
+  epc_status_t init_status = epc660_power_up();
+  if (init_status == EPC_OK)
+  {
+    init_status = epc660_init();
+  }
+
+  if (init_status != EPC_OK)
+  {
+    power_down_epc660();
+  }
+
+  usb_start_nonfatal();
 
 
   // Clear any pending USB interrupt flags that accumulated, then re-enable
@@ -228,44 +260,20 @@ int main(void)
 
   all_frames_ready = 0;
 
-  epc_status_t preset_status = EPC_OK;
-  switch (current_capture_type)
+  if (epc660_power_state == EPC660_POWER_ON)
   {
-    case CAPTURE_4DCS:
-      preset_status = testing_preset();
-      current_dcmi_dma_length = k_dcmi_dma_length;
-      current_output_buffer = current_angle_buffer;
-      break;
+    epc_status_t preset_status = apply_capture_preset();
 
-    case CAPTURE_2DCS:
-      preset_status = testing_preset();
-      current_dcmi_dma_length = k_dcmi_dma_length;
-      current_output_buffer = current_angle_buffer;
-      break;
-
-    case CAPTURE_AMPLITUDE:
-      preset_status = testing_preset();
-      current_dcmi_dma_length = k_dcmi_dma_length;
-      current_output_buffer = current_angle_buffer;
-      break;
-
-    case CAPTURE_GRAYSCALE:
-      preset_status = default_preset_grayscale();
-      current_dcmi_dma_length = k_dcmi_dma_length_grayscale;
-      current_output_buffer = current_angle_buffer;
-      break;
-
-    default:
-      preset_status = testing_preset();
-      current_dcmi_dma_length = k_dcmi_dma_length;
-      current_output_buffer = current_angle_buffer;
-      break;
+    if (preset_status != EPC_OK)
+    {
+      power_down_epc660();
+    }
+    else
+    {
+      HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+      epc660_trigger_hw_shutter();
+    }
   }
-
-  if (preset_status != EPC_OK) Error_Handler();
-
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
-  epc660_trigger_hw_shutter();
 
   /* USER CODE END 2 */
 
@@ -273,62 +281,59 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // Feed the dog	TODO: Currently disabled, need to re-enable later
+    g_last_feed_time = HAL_GetTick();
+
+    if (epc660_power_toggle_request == 1)
+    {
+      handle_epc660_power_toggle_request();
+    }
+
+    if (epc660_power_state == EPC660_POWER_OFF)
+    {
+      HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+      HAL_Delay(POWER_OFF_BLINK_MS);
+      continue;
+    }
+
 	  // Blinking light to make sure main loop is still running
 	  if (HAL_GetTick() - loop_tick > frame_timeout_ms)
 	  {
-		  HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+		  HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
 		  loop_tick = HAL_GetTick();
 	  }
 
-	  if (all_frames_ready == 1)
-	  {
-		  all_frames_ready = 0;
-      
+	  // If all frames ready
+	  // If user sends configuration information
+	  // If camera error
+	  // If time to do temperature calibration
 
-      // Process frames if necessary
-	  if (current_capture_type == CAPTURE_AMPLITUDE)
-	  {
-		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
-		  calculate_amplitude_simple();
-		  SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
-	  }
-	  else if (current_capture_type == CAPTURE_4DCS)
-	  {
-		  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
-		  calculate_depth_simple();
-		  SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
-	  }
-      else if (current_capture_type == CAPTURE_GRAYSCALE)
-      {
-        SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
-        calculate_grayscale_simple();
-        SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
-      }
 
-		  USB_Transmit_Frame(current_output_buffer);
 
-		  HAL_DCMI_Stop(&hdcmi);
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
-		  epc660_trigger_hw_shutter();
-	  }
+    if (all_frames_ready == 1)
+    {
+      process_and_transmit_data();
+    }
 
-	  if (camera_error_flag == 1)
-	  {
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
-		  epc660_trigger_hw_shutter();
-	      camera_error_flag = 0;
-	  }
+    if (dcmi_error_flag == 1)
+    {
+      handle_dcmi_error();
+    }
+
+    if (reset_epc660_flag == 1)
+    {
+      handle_epc660_reset();
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  // Feed the dog	TODO: Currently disabled, need to re-enable later
-	  g_last_feed_time = HAL_GetTick();
-	  if (trigger_debug == 1)
-	  {
-		  default_preset_4DCS();
-		  default_preset_grayscale();
-		  testing_preset2();
-	  }
+    // Feed the dog	TODO: Currently disabled, need to re-enable later
+    if (trigger_debug == 1)
+    {
+      default_preset_4DCS();
+      default_preset_grayscale();
+      testing_preset2();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -516,7 +521,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CC_RESET_GPIO_Port, CC_RESET_Pin, GPIO_PIN_RESET);
@@ -526,17 +531,17 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, ENABLE_5V_10V_Pin|ENABLE_1V8_3V3_Pin|ENABLE_NEG10V_Pin|LED1_Pin
-                          |ENABLE_15V_Pin|LED4_Pin, GPIO_PIN_RESET);
+                          |ENABLE_15V_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : LED3_Pin */
-  GPIO_InitStruct.Pin = LED3_Pin;
+  /*Configure GPIO pin : LED2_Pin */
+  GPIO_InitStruct.Pin = LED2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED3_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED2_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : CC_RESET_Pin */
   GPIO_InitStruct.Pin = CC_RESET_Pin;
@@ -553,26 +558,26 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(CC_SHUTTER_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : ENABLE_5V_10V_Pin ENABLE_1V8_3V3_Pin ENABLE_NEG10V_Pin LED1_Pin
-                           ENABLE_15V_Pin LED4_Pin */
+                           ENABLE_15V_Pin */
   GPIO_InitStruct.Pin = ENABLE_5V_10V_Pin|ENABLE_1V8_3V3_Pin|ENABLE_NEG10V_Pin|LED1_Pin
-                          |ENABLE_15V_Pin|LED4_Pin;
+                          |ENABLE_15V_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED3_Pin */
+  GPIO_InitStruct.Pin = LED3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED3_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : BUTTON_Pin */
   GPIO_InitStruct.Pin = BUTTON_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(BUTTON_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LED2_Pin */
-  GPIO_InitStruct.Pin = LED2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED2_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(BUTTON_EXTI_IRQn, 0, 0);
@@ -587,22 +592,316 @@ static void MX_GPIO_Init(void)
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
 /************************************************* USER DEFINED FUNCTIONS ********************************************/
-//void HAL_DCMI_VsyncEventCallback(DCMI_HandleTypeDef *hdcmi)
-//{
-//  frame_capture_count++;
-//
-//  if (frame_capture_count >= 2)
-//  {
-//	  all_frames_ready = 2;
-//  }
-//
-//  if (frame_capture_count >= 4)
-//  {
-//	  HAL_DCMI_Stop(hdcmi);
-//	  all_frames_ready = 1;
-//	  frame_capture_count = 0;
-//  }
-//}
+static void process_and_transmit_data(void)
+{
+  uint8_t frame_processed = 0;
+
+  all_frames_ready = 0;
+  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+
+  switch (current_capture_type)
+  {
+    case CAPTURE_AMPLITUDE:
+      calculate_amplitude_simple();
+      frame_processed = 1;
+      break;
+
+    case CAPTURE_4DCS:
+      calculate_depth_simple();
+      frame_processed = 1;
+      break;
+
+    case CAPTURE_GRAYSCALE:
+      calculate_grayscale_simple();
+      frame_processed = 1;
+      break;
+
+    case CAPTURE_2DCS:
+    default:
+      break;
+  }
+
+  if (frame_processed != 0)
+  {
+    SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
+  }
+
+  USB_Transmit_Frame(current_output_buffer);
+
+  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+  epc660_trigger_hw_shutter();
+}
+
+static epc_status_t apply_capture_preset(void)
+{
+  epc_status_t preset_status = EPC_OK;
+
+  switch (current_capture_type)
+  {
+    case CAPTURE_4DCS:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
+
+    case CAPTURE_2DCS:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
+
+    case CAPTURE_AMPLITUDE:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
+
+    case CAPTURE_GRAYSCALE:
+      preset_status = default_preset_grayscale();
+      current_dcmi_dma_length = k_dcmi_dma_length_grayscale;
+      current_output_buffer = current_angle_buffer;
+      break;
+
+    default:
+      preset_status = testing_preset();
+      current_dcmi_dma_length = k_dcmi_dma_length;
+      current_output_buffer = current_angle_buffer;
+      break;
+  }
+
+  return preset_status;
+}
+
+static void handle_epc660_reset(void)
+{
+  reset_epc660_flag = 0;
+  all_frames_ready = 0;
+  dcmi_error_flag = 0;
+
+  HAL_DCMI_Stop(&hdcmi);
+
+  if (hdcmi.DMA_Handle != NULL)
+  {
+    (void)HAL_DMA_Abort(hdcmi.DMA_Handle);
+  }
+
+  __HAL_DCMI_CLEAR_FLAG(&hdcmi,
+                        DCMI_FLAG_FRAMERI |
+                        DCMI_FLAG_OVRRI |
+                        DCMI_FLAG_ERRRI |
+                        DCMI_FLAG_VSYNCRI |
+                        DCMI_FLAG_LINERI);
+
+  hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+
+  epc_reset_pin_set(0);
+  epc_delay_ms(1);
+  epc_reset_pin_set(1);
+  epc_delay_ms(2);
+
+  if (epc660_init() != EPC_OK)
+  {
+    power_down_epc660();
+    return;
+  }
+
+  if (apply_capture_preset() != EPC_OK)
+  {
+    power_down_epc660();
+    return;
+  }
+
+  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+
+  if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length) != HAL_OK)
+  {
+    power_down_epc660();
+    return;
+  }
+
+  epc660_trigger_hw_shutter();
+}
+
+static void handle_epc660_power_toggle_request(void)
+{
+  epc660_power_toggle_request = 0;
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+
+  if (epc660_power_state == EPC660_POWER_ON)
+  {
+    power_down_epc660();
+  }
+  else if (power_up_epc660_and_resume_capture() != EPC_OK)
+  {
+    power_down_epc660();
+  }
+}
+
+static void power_down_epc660(void)
+{
+  all_frames_ready = 0;
+  dcmi_error_flag = 0;
+  reset_epc660_flag = 0;
+
+  HAL_DCMI_Stop(&hdcmi);
+
+  if (hdcmi.DMA_Handle != NULL)
+  {
+    (void)HAL_DMA_Abort(hdcmi.DMA_Handle);
+  }
+
+  __HAL_DCMI_DISABLE_IT(&hdcmi,
+                        DCMI_IT_FRAME |
+                        DCMI_IT_OVF |
+                        DCMI_IT_ERR |
+                        DCMI_IT_VSYNC |
+                        DCMI_IT_LINE);
+
+  __HAL_DCMI_CLEAR_FLAG(&hdcmi,
+                        DCMI_FLAG_FRAMERI |
+                        DCMI_FLAG_OVRRI |
+                        DCMI_FLAG_ERRRI |
+                        DCMI_FLAG_VSYNCRI |
+                        DCMI_FLAG_LINERI);
+
+  hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+  HAL_NVIC_DisableIRQ(DMA1_Stream0_IRQn);
+
+  usb_stop_cleanly();
+
+  epc660_power_down();
+  epc660_power_state = EPC660_POWER_OFF;
+}
+
+static epc_status_t power_up_epc660_and_resume_capture(void)
+{
+  if (epc660_power_up() != EPC_OK)
+  {
+    power_down_epc660();
+    return EPC_ERR;
+  }
+
+  // Bring USB back after EPC rails are enabled. If host is absent, keep running.
+  usb_start_nonfatal();
+
+  if (epc660_init() != EPC_OK)
+  {
+    power_down_epc660();
+    return EPC_ERR;
+  }
+
+  if (apply_capture_preset() != EPC_OK)
+  {
+    power_down_epc660();
+    return EPC_ERR;
+  }
+  epc660_power_state = EPC660_POWER_ON;
+
+  __HAL_DCMI_CLEAR_FLAG(&hdcmi,
+                        DCMI_FLAG_FRAMERI |
+                        DCMI_FLAG_OVRRI |
+                        DCMI_FLAG_ERRRI |
+                        DCMI_FLAG_VSYNCRI |
+                        DCMI_FLAG_LINERI);
+
+  hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+
+  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  __HAL_DCMI_ENABLE_IT(&hdcmi,
+                       DCMI_IT_FRAME |
+                       DCMI_IT_OVF |
+                       DCMI_IT_ERR |
+                       DCMI_IT_VSYNC |
+                       DCMI_IT_LINE);
+
+  if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length) != HAL_OK)
+  {
+    power_down_epc660();
+    return EPC_ERR;
+  }
+
+  epc660_trigger_hw_shutter();
+  return EPC_OK;
+}
+
+static void usb_stop_cleanly(void)
+{
+  // If USB stack was never initialized, pData is NULL and LL stop/deinit would hardfault.
+  if (hUsbDeviceHS.pData != NULL)
+  {
+    (void)USBD_Stop(&hUsbDeviceHS);
+    (void)USBD_DeInit(&hUsbDeviceHS);
+    hUsbDeviceHS.pData = NULL;
+  }
+
+  HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
+  NVIC_ClearPendingIRQ(OTG_HS_IRQn);
+}
+
+static void usb_start_nonfatal(void)
+{
+  if (hUsbDeviceHS.dev_state == USBD_STATE_CONFIGURED)
+  {
+    return;
+  }
+
+  usb_stop_cleanly();
+  HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
+
+  if (USBD_Init(&hUsbDeviceHS, &HS_Desc, DEVICE_HS) != USBD_OK)
+  {
+    return;
+  }
+
+  if (USBD_RegisterClass(&hUsbDeviceHS, &USBD_CDC) != USBD_OK)
+  {
+    (void)USBD_DeInit(&hUsbDeviceHS);
+    return;
+  }
+
+  if (USBD_CDC_RegisterInterface(&hUsbDeviceHS, &USBD_Interface_fops_HS) != USBD_OK)
+  {
+    (void)USBD_DeInit(&hUsbDeviceHS);
+    return;
+  }
+
+  if (USBD_Start(&hUsbDeviceHS) != USBD_OK)
+  {
+    (void)USBD_DeInit(&hUsbDeviceHS);
+    return;
+  }
+
+  HAL_PWREx_EnableUSBVoltageDetector();
+}
+
+static void handle_dcmi_error(void)
+{
+  // Clear first so a new error raised during recovery is not lost.
+  dcmi_error_flag = 0;
+
+  HAL_DCMI_Stop(&hdcmi);
+
+  if (hdcmi.DMA_Handle != NULL)
+  {
+    (void)HAL_DMA_Abort(hdcmi.DMA_Handle);
+  }
+
+  __HAL_DCMI_CLEAR_FLAG(&hdcmi,
+                        DCMI_FLAG_FRAMERI |
+                        DCMI_FLAG_OVRRI |
+                        DCMI_FLAG_ERRRI |
+                        DCMI_FLAG_VSYNCRI |
+                        DCMI_FLAG_LINERI);
+
+  hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+  SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
+
+  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+  epc660_trigger_hw_shutter();
+}
+
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
   HAL_DCMI_Stop(hdcmi);
@@ -640,7 +939,7 @@ void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
         // If an error happens, the best way to recover is usually to stop the
         // DCMI, clear the state, and get ready for a fresh capture.
         HAL_DCMI_Stop(hdcmi);
-        camera_error_flag = 1;
+        dcmi_error_flag = 1;
     }
 }
 
@@ -672,7 +971,10 @@ static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
 }
 static void USB_Transmit_Frame(uint16_t* frame_pointer)
 {
-	while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);
+  if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED)
+  {
+    return;
+  }
 
 	USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
 
@@ -700,7 +1002,7 @@ static void USB_Transmit_Frame(uint16_t* frame_pointer)
 void calculate_depth_simple(void)
 {
   uint32_t saturated_count = 0;
-  for (int i = 0; i < (320 * 240); i++)
+  for (uint32_t i = 0; i < SINGLE_FRAME_SIZE; i++)
     {
 		uint16_t raw1 = (p_frame1[i] & 0x0FFF);
 		uint16_t raw2 = (p_frame2[i] & 0x0FFF);
@@ -743,7 +1045,7 @@ void calculate_amplitude_simple(void)
   uint64_t sum_abs_q = 0;
   uint32_t valid_count = 0;
   // For stats, delete later
-  for (int i = 0; i < (320 * 240); i++)
+  for (uint32_t i = 0; i < SINGLE_FRAME_SIZE; i++)
   {
   uint16_t raw1 = (p_frame1[i] & 0x0FFF);
   uint16_t raw2 = (p_frame2[i] & 0x0FFF);
@@ -818,7 +1120,7 @@ void calculate_grayscale_simple(void)
 {
   uint32_t saturated_count = 0;
 
-  for (int i = 0; i < (320 * 240); i++)
+  for (uint32_t i = 0; i < SINGLE_FRAME_SIZE; i++)
   {
     uint16_t raw = (p_frame1[i] & 0x0FFF);
 
@@ -838,7 +1140,16 @@ void calculate_grayscale_simple(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     /* Check if the interrupt came from BUTTON */
-    if (GPIO_Pin == BUTTON_Pin) Error_Handler();
+    if (GPIO_Pin == BUTTON_Pin)
+    {
+      uint32_t now = HAL_GetTick();
+
+      if ((now - button_last_press_ms) >= BUTTON_DEBOUNCE_MS)
+      {
+        button_last_press_ms = now;
+        epc660_power_toggle_request = 1;
+      }
+    }
 }
 
 /* EPC660 CONFIG PRESETS */
@@ -860,7 +1171,7 @@ __attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale()
 	__NOP();
 	volatile epc_status_t status;
 	epc_set_measurement_mode(EPC_MODE_GRAYSCALE);
-	epc_set_grayscale_mode(EPC_GS_MODULATED_LED);	// No illumination
+	epc_set_grayscale_mode(EPC_GS_MODULATED_LED);	// Illumination
 	epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
 	if (epc_i2c_write(0x3A, 0x30, EPC_DIRECT) != EPC_OK) return EPC_ERR;	// Grayscale setting thing
 	epc_set_hsync_stretch(1);	//Hsync stretching
@@ -959,7 +1270,7 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
-	HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+	HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
 
 	if (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)
 	{

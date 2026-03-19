@@ -57,8 +57,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define LED3_Pin GPIO_PIN_2
-#define LED3_GPIO_Port GPIOA
+#define LED2_Pin GPIO_PIN_2
+#define LED2_GPIO_Port GPIOA
 #define CC_RESET_Pin GPIO_PIN_5
 #define CC_RESET_GPIO_Port GPIOC
 #define CC_SHUTTER_Pin GPIO_PIN_1
@@ -73,13 +73,11 @@ void Error_Handler(void);
 #define LED1_GPIO_Port GPIOE
 #define ENABLE_15V_Pin GPIO_PIN_14
 #define ENABLE_15V_GPIO_Port GPIOE
-#define BUTTON_Pin GPIO_PIN_15
+#define LED3_Pin GPIO_PIN_14
+#define LED3_GPIO_Port GPIOD
+#define BUTTON_Pin GPIO_PIN_8
 #define BUTTON_GPIO_Port GPIOB
-#define BUTTON_EXTI_IRQn EXTI15_10_IRQn
-#define LED2_Pin GPIO_PIN_14
-#define LED2_GPIO_Port GPIOD
-#define LED4_Pin GPIO_PIN_0
-#define LED4_GPIO_Port GPIOE
+#define BUTTON_EXTI_IRQn EXTI9_5_IRQn
 
 /* USER CODE BEGIN Private defines */
 
