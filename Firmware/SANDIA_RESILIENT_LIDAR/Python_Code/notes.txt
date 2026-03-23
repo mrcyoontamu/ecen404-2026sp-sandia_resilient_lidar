@@ -1,0 +1,40 @@
+Notes for improved Lidar:
+
+1. Send 4 DCS ("raw") frames instead of 1 phase frame
+
+frame1, frame2, frame3, frame4	// This is slower because USB transfer is the bottleneck
+
+I = frame3 - frame1
+Q = frame 4 - frame2
+
+Phase_frame = arctan(I/Q)	// Phase -> 16bit integer scale 0 = 0 deg; 65536 = 360 deg
+depth (meters) = (Phase_frame * c) / (2*pi*fmod)
+
+2. Some sort of denoising is necessary
+3. Amplitude correction? Grayscale correction?
+
+
+4. Pause button?
+5. Point and click depth measurement when paused?
+    (Relies on LED modulation frequency)
+6. Save frame button?
+
+7. 3D point cloud visualization for presentation purposes.
+    - Also helpful for debugging.
+
+
+**************** What's happening now ***************
+
+PC needs to have the USB connect/reconnect capability
+
+PC side receives a frame header = {0xAA, 0x55, 0xAA, 0x55}
+That tells the PC that a frame transfer is about to begin
+    - eventually, there will also need to be other types of communication
+
+Row order of the pixels needs to be reconstructed
+    - epc transmits in this order:
+       Send row 120, 119, 121, 118, 122, 117, 123 etc. all the way to 240, 1
+
+If the data received is 0x0FFF, then that means the pixel is saturated and shouldn't be used for depth
+
+Then displays the image
