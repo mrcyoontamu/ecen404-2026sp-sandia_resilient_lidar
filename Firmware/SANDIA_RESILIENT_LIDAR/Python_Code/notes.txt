@@ -38,3 +38,9 @@ Row order of the pixels needs to be reconstructed
 If the data received is 0x0FFF, then that means the pixel is saturated and shouldn't be used for depth
 
 Then displays the image
+
+
+**************** What needs to change from the MCU side *********************
+Need to send 4 DCS frames instead of the 1 phase frame
+
+Need to do temperature calibration
