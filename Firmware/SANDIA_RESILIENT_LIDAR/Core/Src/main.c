@@ -270,7 +270,10 @@ int main(void)
     }
     else
     {
-      HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+      if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length) != HAL_OK)
+      {
+        power_down_epc660();
+      }
       epc660_trigger_hw_shutter();
     }
   }
@@ -303,9 +306,7 @@ int main(void)
 		  loop_tick = HAL_GetTick();
 	  }
 
-	  // If all frames ready
 	  // If user sends configuration information
-	  // If camera error
 	  // If time to do temperature calibration
 
 
@@ -628,7 +629,11 @@ static void process_and_transmit_data(void)
 
   USB_Transmit_Frame(current_output_buffer);
 
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+  if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length) != HAL_OK)
+  {
+    dcmi_error_flag = 1;
+    return;
+  }
   epc660_trigger_hw_shutter();
 }
 
@@ -639,7 +644,7 @@ static epc_status_t apply_capture_preset(void)
   switch (current_capture_type)
   {
     case CAPTURE_4DCS:
-      preset_status = testing_preset();
+      preset_status = default_preset_4DCS();
       current_dcmi_dma_length = k_dcmi_dma_length;
       current_output_buffer = current_angle_buffer;
       break;
@@ -898,7 +903,11 @@ static void handle_dcmi_error(void)
   hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
   SCB_InvalidateDCache_by_Addr((uint32_t*)quad_frame_buffer, current_dcmi_dma_length * sizeof(uint32_t));
 
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length);
+  if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_CONTINUOUS, (uint32_t)quad_frame_buffer, current_dcmi_dma_length) != HAL_OK)
+  {
+    power_down_epc660();
+    return;
+  }
   epc660_trigger_hw_shutter();
 }
 
@@ -1160,8 +1169,8 @@ __attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS()
 	epc_set_measurement_mode(EPC_MODE_4DCS_TOF);
 	epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
 	epc_set_hsync_stretch(1);	//Hsync stretching
-	status = epc_set_modulation_divider(3);	// Explicitly set 12MHz modulation
-	status = epc_set_integration_time_raw(1, 599);	// This sets an integration time of 1.58us as per the datasheet
+	status = epc_set_modulation_divider(0);	// Explicitly set 12MHz modulation
+	if ((status = epc_set_integration_time_raw(2, 38399)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
 	epc_set_software_saturation_flag(1);
 
 	return EPC_OK;
@@ -1185,7 +1194,7 @@ __attribute__((used, optimize("O0"))) epc_status_t testing_preset()
 	if ((status = epc_set_measurement_mode(EPC_MODE_4DCS_TOF)) != EPC_OK) return status;
 	if ((status = epc_set_dclk_freq(EPC_DCLK_12MHZ)) != EPC_OK) return status;	// Slow Dclk speed
 	if ((status = epc_set_hsync_stretch(1)) != EPC_OK) return status;	//Hsync stretching
-	if ((status = epc_set_modulation_divider(1)) != EPC_OK) return status;	// Explicitly set 6MHz modulation
+	if ((status = epc_set_modulation_divider(0)) != EPC_OK) return status;	// Explicitly set 6MHz modulation
 	if ((status = epc_set_integration_time_raw(1, 599)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
 	if ((status = epc_set_software_saturation_flag(1)) != EPC_OK) return status;
 
