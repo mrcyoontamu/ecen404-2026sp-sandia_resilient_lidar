@@ -94,6 +94,8 @@
 extern USBD_CDC_ItfTypeDef USBD_Interface_fops_HS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
+extern volatile uint8_t g_usb_capture_request_pending;
+extern volatile uint8_t g_usb_status_request_pending;
 
 /* USER CODE END EXPORTED_VARIABLES */
 

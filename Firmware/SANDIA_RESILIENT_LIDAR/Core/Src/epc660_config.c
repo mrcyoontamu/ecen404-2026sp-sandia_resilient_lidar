@@ -139,16 +139,16 @@ epc_status_t epc660_cfg_set_integration_time_us(uint16_t tint_us)
     double P = (double)tint_us * 96.0 / (double)(mod_div + 1);
 
     /* Validate achievable range */
-    const double MAX_P = 65536.0 * 65535.0; // (base+1) * multiplier max
+	const double MAX_P = 65536.0 * 1023.0; // 16-bit base and 10-bit multiplier
     if (P < 1.0 || P > MAX_P) {
         return EPC_ERR_PARAM;
     }
 
     /* 3) Prefer small multiplier / large base_count: try multiplier=1..65535 */
     /*    Constraint: (base_count + 1) must be divisible by 4 per datasheet */
-    uint16_t selected_mult = 0;
+	uint16_t selected_mult = 0;
     uint16_t selected_base = 0;
-    for (uint32_t m = 1; m <= 65535; ++m) {
+	for (uint32_t m = 1; m <= 1023; ++m) {
         uint32_t base_plus_one = (uint32_t)(P / (double)m + 0.5); // rounded
         /* Round to nearest multiple of 4 (integration length+1 must be div by 4) */
         base_plus_one = ((base_plus_one + 2) / 4) * 4;
@@ -163,11 +163,11 @@ epc_status_t epc660_cfg_set_integration_time_us(uint16_t tint_us)
         return EPC_ERR_PARAM;
     }
 
-    /* 4) Write registers (multiplier -> 0xA0/0xA1, base_count -> 0xA2/0xA3) */
-    if ((status = epc_i2c_write(0xA0, (uint8_t)(selected_mult & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA1, (uint8_t)((selected_mult >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA2, (uint8_t)(selected_base & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
-    if ((status = epc_i2c_write(0xA3, (uint8_t)((selected_base >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+	/* 4) Write registers (big-endian in EPC register map: A0/A2 are MSB, A1/A3 are LSB) */
+	if ((status = epc_i2c_write(0xA0, (uint8_t)((selected_mult >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+	if ((status = epc_i2c_write(0xA1, (uint8_t)(selected_mult & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+	if ((status = epc_i2c_write(0xA2, (uint8_t)((selected_base >> 8) & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
+	if ((status = epc_i2c_write(0xA3, (uint8_t)(selected_base & 0xFF), EPC_DIRECT)) != EPC_OK) return status;
 
     return EPC_OK;
 }

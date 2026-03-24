@@ -96,6 +96,8 @@ uint8_t UserRxBufferHS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferHS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
+extern volatile uint8_t g_usb_capture_request_pending;
+extern volatile uint8_t g_usb_status_request_pending;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -265,6 +267,21 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
+  if ((Buf != NULL) && (Len != NULL) && (*Len > 0U))
+  {
+    for (uint32_t i = 0; i < *Len; i++)
+    {
+      if ((Buf[i] == (uint8_t)'G') || (Buf[i] == (uint8_t)'g'))
+      {
+        g_usb_capture_request_pending = 1U;
+      }
+      else if ((Buf[i] == (uint8_t)'S') || (Buf[i] == (uint8_t)'s'))
+      {
+        g_usb_status_request_pending = 1U;
+      }
+    }
+  }
+
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceHS);
   return (USBD_OK);

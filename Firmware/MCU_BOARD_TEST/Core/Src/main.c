@@ -22,16 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
 
 #include "usbd_cdc_if.h"
-
-#include "common.h"
-#include "ov7670.h"
-
-#include "core_cm7.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,10 +34,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define IMG_WIDTH 320
-#define IMG_HEIGHT 240
-#define SINGLE_FRAME_SIZE IMG_WIDTH * IMG_HEIGHT
-#define NUM_FRAMES 4
+// Compile-time test configuration
+#define PAYLOAD_SIZE_BYTES 614400
+// Valid sizes to try: 4096, 32768, 61440, 32764, 614400
+
+#define CHUNK_SIZE_BYTES 32768
+// Valid chunk sizes to try: 2048, 8192, 32768
+
+#define SEND_PERIOD_MS 2000
+#define TX_WAIT_TIMEOUT_MS 5000
+#define HOST_TRIGGER_MODE 0
+// Set to 1 to send a single frame only after host sends 'G'
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,47 +54,32 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-DCMI_HandleTypeDef hdcmi;
-DMA_HandleTypeDef hdma_dcmi;
-
 I2C_HandleTypeDef hi2c2;
 
 /* USER CODE BEGIN PV */
-extern uint8_t UserTxBufferHS[]; /* Access the buffer we moved to Safe RAM */
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
-uint16_t quad_frame_buffer[IMG_WIDTH*IMG_HEIGHT*NUM_FRAMES];
+static uint8_t payload_buffer[PAYLOAD_SIZE_BYTES];
 
-// One buffer to reference frame angles
-uint16_t reference_angle_buffer[SINGLE_FRAME_SIZE];
-
-// One buffer for current frame angles
-uint16_t current_angle_buffer[SINGLE_FRAME_SIZE];
-
-// A "flag" to signal when a frame is ready to be sent
-volatile uint8_t frame_ready = 0;
-
-// Some timer variables to be used with DWT
-volatile uint32_t tDCMI_start, tDCMI_end;
+volatile uint32_t frames_attempted = 0;
+volatile uint32_t frames_sent_ok = 0;
+volatile uint32_t frames_aborted = 0;
+volatile uint32_t chunks_sent_ok = 0;
+volatile uint32_t chunks_failed = 0;
+volatile uint32_t tx_wait_timeout_count = 0;
+volatile uint8_t g_usb_rx_trigger_g = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
 static void MX_I2C2_Init(void);
-static void MX_DCMI_Init(void);
 /* USER CODE BEGIN PFP */
-void I2C_Scanner(void);
-
-void vprint(const char *fmt, va_list argp);
-void my_printf(const char *fmt, ...);
-
-void usb_printf(char *msg);
-static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
-
-void DWT_Init(void);
+static void Fill_Payload(uint32_t sequence, uint8_t *buf, uint32_t len);
+static uint8_t USB_Transmit_Blocking(uint8_t *buf, uint16_t len);
+static uint8_t USB_Transmit_Buffer_Blocking(const uint8_t *buf, uint32_t len);
+static void Send_Test_Frame(uint32_t sequence);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -142,126 +127,37 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_I2C2_Init();
   MX_USB_DEVICE_Init();
-  MX_DCMI_Init();
   /* USER CODE BEGIN 2 */
-  DWT_Init();
-
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET); //Camera PWDN to GND
-  ov7670_init(&hdcmi, &hdma_dcmi, &hi2c2);
-  ov7670_config(OV7670_MODE_QVGA_RGB565);
-  ov7670_stopCap();
-
-  const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
-
-  uint32_t last_frame_tick = 0;
-  uint32_t loop_tick = 0;
-  uint32_t frame_timeout_ms = 1000;
-
-  float cpu_freq_mhz = (float)HAL_RCC_GetHCLKFreq() / 1000000.0f;
-
-  // Variables for timing
-  uint32_t start_cycles, end_cycles, delta_cycles;
-  float time_us;
-
-  //HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
+  uint32_t next_send_tick = HAL_GetTick();
+  uint32_t sequence = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_Delay(1000);
-	  usb_printf((char*)"USB Working!\r\n");
-	  // Blinking light to make sure main loop is still running
-	  if (HAL_GetTick() - loop_tick > frame_timeout_ms)
-	  {
-		  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-		  loop_tick = HAL_GetTick();
-	  }
+    uint32_t now = HAL_GetTick();
 
-	  if(frame_ready == 1)
-	  {
+    if (HOST_TRIGGER_MODE)
+    {
+      if (CDC_ConsumeTrigger_G())
+      {
+        Send_Test_Frame(sequence++);
+      }
+    }
+    else
+    {
+      if ((int32_t)(now - next_send_tick) >= 0)
+      {
+        Send_Test_Frame(sequence++);
+        next_send_tick = now + SEND_PERIOD_MS;
+      }
+    }
 
-//		  my_printf("DCMI frame capture duration: %.3f\r\n", (float)(tDCMI_end - tDCMI_start) / cpu_freq_mhz);
-
-		  frame_ready = 0;
-
-		  // Marked for death, I think this is useless
-		  while (HAL_DCMI_GetState(&hdcmi) != HAL_DCMI_STATE_READY)
-		  {
-			  HAL_Delay(100);// optional: add timeout protection here
-		  }
-
-
-
-		  start_cycles = DWT->CYCCNT;
-		  while(hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED);	// Waiting loop
-
-		  USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4);
-		  uint8_t* p_buffer = (uint8_t*)quad_frame_buffer;
-		  uint32_t bytes_remaining = 320 * 240 * 2; // 153,600
-		  uint16_t chunk_size;
-
-		  while (bytes_remaining > 0)
-		  {
-			  // Calculate the size of the next chunk
-			  if (bytes_remaining > 65535) {
-				  chunk_size = 65535;
-			  } else {
-				  chunk_size = (uint16_t)bytes_remaining;
-			  }
-
-			  // Send the chunk
-			  USB_Transmit_Blocking(p_buffer, chunk_size);
-
-			  // Move the pointer and update the remaining count
-			  p_buffer += chunk_size;
-			  bytes_remaining -= chunk_size;
-		  }
-		  end_cycles = DWT->CYCCNT;
-//		  my_printf("USB frame transmission: %.3f\r\n", (float)(end_cycles - start_cycles) / cpu_freq_mhz);
-		  HAL_DCMI_Stop(&hdcmi);
-
-		  // Start our tDCMI counter
-		  tDCMI_start = DWT->CYCCNT;
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)quad_frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
-		  last_frame_tick = HAL_GetTick();
-	  }
-	  if (HAL_GetTick() - last_frame_tick > frame_timeout_ms)
-	  {
-		  HAL_DCMI_Stop(&hdcmi);
-		  HAL_DCMI_DeInit(&hdcmi);
-		  MX_DCMI_Init(); // call your CubeMX-generated init function again
-
-		  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)quad_frame_buffer, IMG_WIDTH * IMG_HEIGHT / 2);
-		  last_frame_tick = HAL_GetTick();
-	  }
-// SOME OLD CODE TO TEST I2C AND USB
-//	  I2C_Scanner();
-//	  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-//	  static uint32_t counter = 0;
-//
-//	  // 1. Format the string directly into the Safe Buffer
-//	  // (This works safely because UserTxBufferHS is in the MPU protected area)
-//	  int len = sprintf((char *)UserTxBufferHS, "STM32 Alive! Count: %lu\r\n", counter++);
-//
-//	  // 2. Send the data
-//	  // We check if the USB is free (USBD_OK) before sending
-//	  if (CDC_Transmit_HS(UserTxBufferHS, len) == USBD_OK)
-//	  {
-//		  // Optional: Toggle an LED here to visualize successful transmission
-//		  // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-//	  }
-//	  else
-//	  {
-//		  // If USB was busy, we just skip this frame and try again next time
-//	  }
-//
-//	  // 3. Wait a bit so we don't flood the terminal
-//	  HAL_Delay(1000);
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(1);
 
     /* USER CODE END WHILE */
 
@@ -332,43 +228,6 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief DCMI Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_DCMI_Init(void)
-{
-
-  /* USER CODE BEGIN DCMI_Init 0 */
-
-  /* USER CODE END DCMI_Init 0 */
-
-  /* USER CODE BEGIN DCMI_Init 1 */
-
-  /* USER CODE END DCMI_Init 1 */
-  hdcmi.Instance = DCMI;
-  hdcmi.Init.SynchroMode = DCMI_SYNCHRO_HARDWARE;
-  hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_RISING;
-  hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
-  hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_LOW;
-  hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
-  hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_8B;
-  hdcmi.Init.JPEGMode = DCMI_JPEG_DISABLE;
-  hdcmi.Init.ByteSelectMode = DCMI_BSM_ALL;
-  hdcmi.Init.ByteSelectStart = DCMI_OEBS_ODD;
-  hdcmi.Init.LineSelectMode = DCMI_LSM_ALL;
-  hdcmi.Init.LineSelectStart = DCMI_OELS_ODD;
-  if (HAL_DCMI_Init(&hdcmi) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN DCMI_Init 2 */
-
-  /* USER CODE END DCMI_Init 2 */
-
-}
-
-/**
   * @brief I2C2 Initialization Function
   * @param None
   * @retval None
@@ -417,22 +276,6 @@ static void MX_I2C2_Init(void)
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -445,12 +288,10 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, LED_Pin|GPIO_PIN_2|CAMERA_RESET_Pin, GPIO_PIN_RESET);
@@ -468,119 +309,112 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
-//void I2C_Scanner(void)
-//{
-//    char msg[64];
-//    HAL_UART_Transmit(&huart6, (uint8_t*)"Scanning I2C bus...\r\n", 21, 100);
-//
-//    HAL_StatusTypeDef result;
-//    uint8_t i;
-//    int count = 0;
-//
-//    for (i = 1; i < 128; i++)
-//    {
-//        /*
-//         * HAL_I2C_IsDeviceReady checks if a device acknowledges an address.
-//         * Params:
-//         * 1. I2C Handle (&hi2c1)
-//         * 2. Device Address (shifted left by 1)
-//         * 3. Number of trials (1 is usually enough)
-//         * 4. Timeout in ms (10ms)
-//         */
-//        result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(i << 1), 1, 10);
-//
-//        if (result == HAL_OK)
-//        {
-//            sprintf(msg, "I2C device found at address: 0x%02X\r\n", i);
-//            HAL_UART_Transmit(&huart6, (uint8_t*)msg, strlen(msg), 100);
-//            count++;
-//        }
-//    }
-//
-//    if (count == 0)
-//    {
-//        HAL_UART_Transmit(&huart6, (uint8_t*)"No I2C devices found.\r\n", 25, 100);
-//    }
-//    else
-//    {
-//        HAL_UART_Transmit(&huart6, (uint8_t*)"Scan Complete.\r\n", 16, 100);
-//    }
-//}
-//void vprint(const char *fmt, va_list argp) {
-//	char string[200];
-//	if (0 < vsprintf(string, fmt, argp)) // build string
-//	{
-//		HAL_UART_Transmit(&huart3, (uint8_t*) string, strlen(string), 0xffffff); // send message via UART
-//	}
-//}
-//
-//void my_printf(const char *fmt, ...) // custom printf() function
-//{
-//	va_list argp;
-//	va_start(argp, fmt);
-//	vprint(fmt, argp);
-//	va_end(argp);
-//}
-void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
+static void Fill_Payload(uint32_t sequence, uint8_t *buf, uint32_t len)
 {
-  // This function is called by the HAL when the DMA has
-  // successfully captured a complete frame.
-
-  // 1. Set our flag so the main loop knows it can send the data
-  frame_ready = 1;
-  tDCMI_end = DWT->CYCCNT;
-
-//  // 2. Stop the DCMI from capturing more frames
-//  //    We will restart it manually after we're done sending.
+  uint32_t i;
+  for (i = 0; i < len; i++)
+  {
+    buf[i] = (uint8_t)((sequence + i) & 0xFFu);
+  }
 }
 
-void usb_printf(char *msg)
+static uint8_t USB_Transmit_Blocking(uint8_t *buf, uint16_t len)
 {
-	if (hUsbDeviceHS.dev_state == USBD_STATE_CONFIGURED)
-	{
-	  // 3. Send the data
-	  CDC_Transmit_HS((uint8_t*)msg, strlen(msg));
-	}
-}
+  USBD_CDC_HandleTypeDef *hcdc;
+  uint32_t start_tick;
 
-static void USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
-{
-    USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceHS.pClassData;
+  if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED)
+  {
+    return 0;
+  }
 
-    // Wait until previous transfer completes
-    while (hcdc->TxState != 0)
+  hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceHS.pClassData;
+  start_tick = HAL_GetTick();
+  while ((hcdc != NULL) && (hcdc->TxState != 0))
+  {
+    if ((HAL_GetTick() - start_tick) > TX_WAIT_TIMEOUT_MS)
     {
-        // Optionally add a timeout here to avoid infinite lockup
+      tx_wait_timeout_count++;
+      return 0;
+    }
+  }
+
+  if (CDC_Transmit_HS(buf, len) != USBD_OK)
+  {
+    return 0;
+  }
+
+  start_tick = HAL_GetTick();
+  while ((hcdc != NULL) && (hcdc->TxState != 0))
+  {
+    if ((HAL_GetTick() - start_tick) > TX_WAIT_TIMEOUT_MS)
+    {
+      tx_wait_timeout_count++;
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+static uint8_t USB_Transmit_Buffer_Blocking(const uint8_t *buf, uint32_t len)
+{
+  uint32_t remaining = len;
+  const uint8_t *p = buf;
+
+  while (remaining > 0)
+  {
+    uint16_t chunk = (remaining > CHUNK_SIZE_BYTES) ? (uint16_t)CHUNK_SIZE_BYTES : (uint16_t)remaining;
+
+    if (!USB_Transmit_Blocking((uint8_t*)p, chunk))
+    {
+      chunks_failed++;
+      return 0;
     }
 
-    // Queue new transfer
-    CDC_Transmit_HS(Buf, Len);
+    chunks_sent_ok++;
+    p += chunk;
+    remaining -= chunk;
+  }
 
-    // Wait until this one completes
-    while (hcdc->TxState != 0)
-    {
-        // Optionally add small delay for CPU efficiency
-    }
+  return 1;
 }
 
-void DWT_Init(void)
+static void Send_Test_Frame(uint32_t sequence)
 {
-  if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk))
+  uint8_t header[12];
+
+  frames_attempted++;
+
+  header[0] = 0xAA;
+  header[1] = 0x55;
+  header[2] = 0xAA;
+  header[3] = 0x55;
+  header[4] = (uint8_t)(sequence & 0xFFu);
+  header[5] = (uint8_t)((sequence >> 8) & 0xFFu);
+  header[6] = (uint8_t)((sequence >> 16) & 0xFFu);
+  header[7] = (uint8_t)((sequence >> 24) & 0xFFu);
+  header[8] = (uint8_t)(PAYLOAD_SIZE_BYTES & 0xFFu);
+  header[9] = (uint8_t)((PAYLOAD_SIZE_BYTES >> 8) & 0xFFu);
+  header[10] = (uint8_t)((PAYLOAD_SIZE_BYTES >> 16) & 0xFFu);
+  header[11] = (uint8_t)((PAYLOAD_SIZE_BYTES >> 24) & 0xFFu);
+
+  Fill_Payload(sequence, payload_buffer, PAYLOAD_SIZE_BYTES);
+
+  if (!USB_Transmit_Blocking(header, sizeof(header)))
   {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    frames_aborted++;
+    return;
   }
-  if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk))
+
+  if (!USB_Transmit_Buffer_Blocking(payload_buffer, PAYLOAD_SIZE_BYTES))
   {
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    frames_aborted++;
+    return;
   }
-  DWT->CYCCNT = 0;
+
+  frames_sent_ok++;
 }
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
-/************************************************* USER DEFINED FUNCTIONS ********************************************/
 /* USER CODE END 4 */
 
  /* MPU Configuration */
