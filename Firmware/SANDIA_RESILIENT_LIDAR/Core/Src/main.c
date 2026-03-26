@@ -36,6 +36,8 @@
 #include "epc660_platform.h"
 #include "epc660_config.h"
 #include "epc660_reg.h"
+#include "usb_stream.h"
+#include "capture_controller.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,15 +56,6 @@ typedef enum
   EPC660_POWER_ON = 0,
   EPC660_POWER_OFF
 } epc660_power_state_t;
-
-typedef enum
-{
-  CAPTURE_SM_IDLE = 0,
-  CAPTURE_SM_ARM_CAPTURE,
-  CAPTURE_SM_WAIT_FRAME,
-  CAPTURE_SM_TX_FRAME,
-  CAPTURE_SM_ERROR_RECOVERY
-} capture_sm_state_t;
 
 /* USER CODE END PTD */
 
@@ -126,8 +119,6 @@ static uint16_t* p_frame2 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 1];
 static uint16_t* p_frame3 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 2];
 static uint16_t* p_frame4 = &quad_frame_buffer[SINGLE_FRAME_SIZE * 3];
 
-static const uint8_t FRAME_HEADER[4] = {0xAA, 0x55, 0xAA, 0x55};
-
 static const uint32_t k_dcmi_dma_length = (SINGLE_FRAME_SIZE * NUM_FRAMES) / 2;
 static const uint32_t k_dcmi_dma_length_grayscale = SINGLE_FRAME_SIZE / 2;
 static uint32_t current_dcmi_dma_length = k_dcmi_dma_length;
@@ -187,9 +178,6 @@ static void MX_I2C2_Init(void);
 static void MX_DCMI_Init(void);
 /* USER CODE BEGIN PFP */
 
-static uint8_t USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len);
-static uint8_t USB_Transmit_Frame(uint16_t* frame_pointer);
-static uint8_t USB_Transmit_Quad_Frame(void);
 static uint8_t process_and_transmit_data(void);
 static void handle_dcmi_error(void);
 static epc_status_t apply_capture_preset(void);
@@ -202,7 +190,6 @@ static void usb_start_nonfatal(void);
 static void dcmi_stop_abort_and_clear(void);
 static void reset_capture_runtime_flags(void);
 static uint8_t start_capture_once(void);
-static const char* capture_state_to_string(capture_sm_state_t state);
 static void send_debug_status_line(void);
 static void run_capture_state_machine(void);
 void calculate_depth_simple(void);
@@ -658,7 +645,9 @@ static uint8_t process_and_transmit_data(void)
   if (transmit_raw_quad != 0)
   {
     SCB_CleanDCache_by_Addr((uint32_t*)quad_frame_buffer, SINGLE_FRAME_SIZE * NUM_FRAMES * 2);
-    tx_ok = USB_Transmit_Quad_Frame();
+    tx_ok = usb_stream_transmit_quad_frame(quad_frame_buffer,
+                         SINGLE_FRAME_SIZE,
+                         NUM_FRAMES);
   }
   else
   {
@@ -667,7 +656,8 @@ static uint8_t process_and_transmit_data(void)
       SCB_CleanDCache_by_Addr((uint32_t*)current_output_buffer, SINGLE_FRAME_SIZE * 2);
     }
 
-    tx_ok = USB_Transmit_Frame(current_output_buffer);
+    tx_ok = usb_stream_transmit_frame(current_output_buffer,
+                      SINGLE_FRAME_SIZE);
   }
 
   return tx_ok;
@@ -936,25 +926,6 @@ static uint8_t start_capture_once(void)
   return 1;
 }
 
-static const char* capture_state_to_string(capture_sm_state_t state)
-{
-  switch (state)
-  {
-    case CAPTURE_SM_IDLE:
-      return "IDLE";
-    case CAPTURE_SM_ARM_CAPTURE:
-      return "ARM";
-    case CAPTURE_SM_WAIT_FRAME:
-      return "WAIT";
-    case CAPTURE_SM_TX_FRAME:
-      return "TX";
-    case CAPTURE_SM_ERROR_RECOVERY:
-      return "REC";
-    default:
-      return "UNK";
-  }
-}
-
 static void send_debug_status_line(void)
 {
   char line[224];
@@ -974,7 +945,7 @@ static void send_debug_status_line(void)
   n = snprintf(line,
                sizeof(line),
                "ST s=%s sh=%lu ok=%lu sf=%lu cb=%lu to=%lu tx=%lu ta=%lu pc=%lu pr=%lu md=%u\r\n",
-               capture_state_to_string(capture_sm_state),
+               capture_controller_state_to_string(capture_sm_state),
                (unsigned long)shutter_count,
                (unsigned long)start_dma_ok_count,
                (unsigned long)start_dma_fail_count,
@@ -996,91 +967,34 @@ static void send_debug_status_line(void)
     n = (int)sizeof(line);
   }
 
-  (void)USB_Transmit_Blocking((uint8_t*)line, (uint16_t)n);
+  (void)usb_stream_transmit_blocking((uint8_t*)line, (uint16_t)n);
 }
 
 static void run_capture_state_machine(void)
 {
-  switch (capture_sm_state)
-  {
-    case CAPTURE_SM_IDLE:
-      if (g_usb_capture_request_pending != 0U)
-      {
-        g_usb_capture_request_pending = 0U;
-        capture_request_active = 1U;
-        capture_recovery_attempted = 0U;
-        capture_sm_state = CAPTURE_SM_ARM_CAPTURE;
-      }
-      break;
+  capture_controller_ctx_t ctx = {
+    .capture_sm_state = &capture_sm_state,
+    .usb_capture_request_pending = &g_usb_capture_request_pending,
+    .capture_request_active = &capture_request_active,
+    .capture_recovery_attempted = &capture_recovery_attempted,
+    .dcmi_error_flag = &dcmi_error_flag,
+    .all_frames_ready = &all_frames_ready,
+    .capture_wait_start_ms = &capture_wait_start_ms,
+    .frame_timeout_count = &frame_timeout_count,
+    .tx_frame_ok_count = &tx_frame_ok_count,
+    .tx_frame_abort_count = &tx_frame_abort_count,
+    .capture_wait_timeout_ms = CAPTURE_WAIT_TIMEOUT_MS
+  };
 
-    case CAPTURE_SM_ARM_CAPTURE:
-      if (start_capture_once() != 0U)
-      {
-        capture_sm_state = CAPTURE_SM_WAIT_FRAME;
-      }
-      else
-      {
-        capture_sm_state = CAPTURE_SM_ERROR_RECOVERY;
-      }
-      break;
+  const capture_controller_ops_t ops = {
+    .start_capture_once = start_capture_once,
+    .process_and_transmit_data = process_and_transmit_data,
+    .handle_dcmi_error = handle_dcmi_error,
+    .dcmi_stop_abort_and_clear = dcmi_stop_abort_and_clear,
+    .get_tick_ms = HAL_GetTick
+  };
 
-    case CAPTURE_SM_WAIT_FRAME:
-      if (dcmi_error_flag != 0U)
-      {
-        capture_sm_state = CAPTURE_SM_ERROR_RECOVERY;
-      }
-      else if (all_frames_ready != 0U)
-      {
-        capture_sm_state = CAPTURE_SM_TX_FRAME;
-      }
-      else if ((HAL_GetTick() - capture_wait_start_ms) > CAPTURE_WAIT_TIMEOUT_MS)
-      {
-        frame_timeout_count++;
-        if (capture_recovery_attempted == 0U)
-        {
-          capture_recovery_attempted = 1U;
-          capture_sm_state = CAPTURE_SM_ERROR_RECOVERY;
-        }
-        else
-        {
-          dcmi_stop_abort_and_clear();
-          capture_request_active = 0U;
-          capture_sm_state = CAPTURE_SM_IDLE;
-        }
-      }
-      break;
-
-    case CAPTURE_SM_TX_FRAME:
-      if (process_and_transmit_data() != 0U)
-      {
-        tx_frame_ok_count++;
-      }
-      else
-      {
-        tx_frame_abort_count++;
-      }
-
-      capture_request_active = 0U;
-      capture_recovery_attempted = 0U;
-      capture_sm_state = CAPTURE_SM_IDLE;
-      break;
-
-    case CAPTURE_SM_ERROR_RECOVERY:
-      handle_dcmi_error();
-      if (capture_request_active != 0U)
-      {
-        capture_sm_state = CAPTURE_SM_ARM_CAPTURE;
-      }
-      else
-      {
-        capture_sm_state = CAPTURE_SM_IDLE;
-      }
-      break;
-
-    default:
-      capture_sm_state = CAPTURE_SM_IDLE;
-      break;
-  }
+  capture_controller_run(&ctx, &ops);
 }
 
 static void handle_dcmi_error(void)
@@ -1129,110 +1043,6 @@ void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
 
         dcmi_error_flag = 1;
     }
-}
-
-static uint8_t USB_Transmit_Blocking(uint8_t* Buf, uint16_t Len)
-{
-  const uint32_t usb_tx_timeout_ms = 1000;
-  uint32_t start = HAL_GetTick();
-
-	if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED) return 0;
-
-    USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceHS.pClassData;
-
-    // Wait until previous transfer completes
-    while (hcdc->TxState != 0)
-    {
-	    if ((HAL_GetTick() - start) > usb_tx_timeout_ms) return 0;
-    }
-
-    // Queue new transfer
-    if (CDC_Transmit_HS(Buf, Len) != USBD_OK) return 0;
-
-    start = HAL_GetTick();
-
-    // Wait until this one completes
-    while (hcdc->TxState != 0)
-    {
-	    if ((HAL_GetTick() - start) > usb_tx_timeout_ms) return 0;
-    }
-
-    return 1;
-}
-static uint8_t USB_Transmit_Frame(uint16_t* frame_pointer)
-{
-  if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED)
-  {
-    return 0;
-  }
-
-  if (USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4) == 0)
-  {
-    return 0;
-  }
-
-	uint8_t* p_buffer = (uint8_t*)frame_pointer;
-	uint32_t bytes_remaining = SINGLE_FRAME_SIZE * 2;
-	uint16_t chunk_size;
-
-	while (bytes_remaining > 0)
-	{
-		if (bytes_remaining > 32768)
-		{
-			chunk_size = 32768;
-		}
-		else
-		{
-			chunk_size = (uint16_t)bytes_remaining;
-		}
-
-    if (USB_Transmit_Blocking(p_buffer, chunk_size) == 0)
-    {
-      return 0;
-    }
-		p_buffer += chunk_size;
-		bytes_remaining -= chunk_size;
-	}
-
-  return 1;
-}
-
-static uint8_t USB_Transmit_Quad_Frame(void)
-{
-  if (hUsbDeviceHS.dev_state != USBD_STATE_CONFIGURED)
-  {
-    return 0;
-  }
-
-  if (USB_Transmit_Blocking((uint8_t*)FRAME_HEADER, 4) == 0)
-  {
-    return 0;
-  }
-
-  uint8_t* p_buffer = (uint8_t*)quad_frame_buffer;
-  uint32_t bytes_remaining = SINGLE_FRAME_SIZE * NUM_FRAMES * 2;
-  uint16_t chunk_size;
-
-  while (bytes_remaining > 0)
-  {
-    if (bytes_remaining > 32768)
-    {
-      chunk_size = 32768;
-    }
-    else
-    {
-      chunk_size = (uint16_t)bytes_remaining;
-    }
-
-    if (USB_Transmit_Blocking(p_buffer, chunk_size) == 0)
-    {
-      return 0;
-    }
-    p_buffer += chunk_size;
-    bytes_remaining -= chunk_size;
-  }
-
-  return 1;
 }
 
 void calculate_depth_simple(void)
