@@ -33,11 +33,11 @@ SPEED_OF_LIGHT_M_PER_S = 299792458.0
 AMPLITUDE_MIN_LSB = 25.0
 
 # Distance offset (DOFFSET in datasheet equation [2]). Keep 0 until calibrated.
-DISTANCE_OFFSET_M = -1.8288
+DISTANCE_OFFSET_M = -1.8
 
 # For calibration, keep negative-offset results clamped at 0 m rather than wrapped
 # to the unambiguous max range (which can look like ~20 ft at 24 MHz).
-WRAP_WITH_UNAMBIGUOUS_RANGE = False
+WRAP_WITH_UNAMBIGUOUS_RANGE = True
 
 # Unambiguous range for iToF phase at modulation frequency f is c/(2f).
 MAX_DEPTH_M = SPEED_OF_LIGHT_M_PER_S / (2.0 * MODULATION_HZ)
@@ -55,6 +55,30 @@ DISPLAY_SCALE = 3
 
 CMD_GET_FRAME = b"G"
 CMD_STATUS = b"S"
+
+
+def draw_outlined_text(img, text, org, font_scale=0.55, thickness=1):
+	# Draw black stroke first, then white text for readability on bright/dark pixels.
+	cv2.putText(
+		img,
+		text,
+		org,
+		cv2.FONT_HERSHEY_SIMPLEX,
+		font_scale,
+		(0, 0, 0),
+		thickness + 2,
+		cv2.LINE_AA,
+	)
+	cv2.putText(
+		img,
+		text,
+		org,
+		cv2.FONT_HERSHEY_SIMPLEX,
+		font_scale,
+		(255, 255, 255),
+		thickness,
+		cv2.LINE_AA,
+	)
 
 
 def list_available_ports():
@@ -366,16 +390,15 @@ def draw_overlay(display_bgr, state):
 	view = display_bgr.copy()
 
 	status = "PAUSED" if state["paused"] else "LIVE"
-	cv2.putText(view, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-	cv2.putText(
+	draw_outlined_text(view, f"{status}  FPS {state['fps']:.1f}", (10, 24), font_scale=0.7, thickness=2)
+	draw_outlined_text(
 		view,
-		"keys: q quit | space pause | s save",
-		(10, 50),
-		cv2.FONT_HERSHEY_SIMPLEX,
-		0.5,
-		(255, 255, 255),
-		1,
+		f"mod {state['modulation_hz'] / 1e6:.2f} MHz | Dmax {state['max_depth_m']:.2f} m",
+		(10, 49),
+		font_scale=0.52,
+		thickness=1,
 	)
+	draw_outlined_text(view, "keys: q quit | space pause | s save", (10, 72), font_scale=0.5, thickness=1)
 
 	if state["clicked_uv"] is not None and state["depth_m"] is not None:
 		u, v = state["clicked_uv"]
@@ -388,7 +411,7 @@ def draw_overlay(display_bgr, state):
 			text = f"({u},{v}) invalid"
 		else:
 			text = f"({u},{v}) {d:.3f} m / {d * 3.28084:.3f} ft"
-		cv2.putText(view, text, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+		draw_outlined_text(view, text, (10, 98), font_scale=0.55, thickness=2)
 
 	return view
 
@@ -407,6 +430,9 @@ def main():
 		"modulation_hz": MODULATION_HZ,
 		"max_depth_m": MAX_DEPTH_M,
 		"depth_scale_m_per_rad": DEPTH_SCALE_M_PER_RAD,
+		"fps": 0.0,
+		"fps_frame_counter": 0,
+		"fps_last_t": time.monotonic(),
 	}
 	cv2.setMouseCallback(WINDOW_NAME, on_mouse, state)
 
@@ -466,6 +492,14 @@ def main():
 					state["phase_rad"] = phase_rad
 					state["depth_m"] = depth_m
 					state["display_bgr"] = display_bgr
+
+					state["fps_frame_counter"] += 1
+					now_fps = time.monotonic()
+					dt = now_fps - state["fps_last_t"]
+					if dt >= 0.5:
+						state["fps"] = state["fps_frame_counter"] / dt
+						state["fps_frame_counter"] = 0
+						state["fps_last_t"] = now_fps
 
 				if state["display_bgr"] is not None:
 					view = draw_overlay(state["display_bgr"], state)

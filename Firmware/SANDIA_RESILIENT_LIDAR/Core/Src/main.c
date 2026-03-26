@@ -1397,7 +1397,7 @@ __attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS()
 	epc_set_dclk_freq(EPC_DCLK_12MHZ);	// Slow Dclk speed
 	epc_set_hsync_stretch(1);	//Hsync stretching
 	status = epc_set_modulation_divider(0);	// Explicitly set 24MHz modulation
-	if ((status = epc_set_integration_time_raw(1, 19199)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
+	if ((status = epc_set_integration_time_raw(2, 38399)) != EPC_OK) return status;	// This sets an integration time of 1.58us as per the datasheet
 	epc_set_software_saturation_flag(1);
 
 	return EPC_OK;
@@ -1453,6 +1453,13 @@ __attribute__((used, optimize("O0"))) epc_status_t testing_preset2()
 	if ((status = epc_set_integration_time_raw(1, 19199)) != EPC_OK) return status;
 	if ((status = epc_set_integration_time_raw(1, 38399)) != EPC_OK) return status;
 	if ((status = epc_set_integration_time_raw(2, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(3, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(4, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(6, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(8, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(10, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(12, 38399)) != EPC_OK) return status;
+	if ((status = epc_set_integration_time_raw(14, 38399)) != EPC_OK) return status;
 
 	if ((status = epc_set_software_saturation_flag(1)) != EPC_OK) return status;
 	if ((status = epc_set_software_saturation_flag(0)) != EPC_OK) return status;
