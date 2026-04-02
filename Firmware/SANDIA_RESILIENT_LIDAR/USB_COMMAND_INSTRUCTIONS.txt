@@ -1,0 +1,109 @@
+USB Command Protocol (Version 1)
+================================
+
+Purpose
+-------
+This protocol is used by the Python host to send control commands to the MCU over USB CDC.
+
+Packet Format (Host -> MCU)
+---------------------------
+All fields are bytes unless noted.
+
+- magic0:      0xA5
+- magic1:      0x5A
+- version:     0x01
+- command_id:  command selector
+- sequence:    host sequence number (echoed in response)
+- payload_len: N (0..24)
+- payload:     N bytes
+- crc16_le:    CRC16-CCITT of all bytes from magic0 through payload
+               CRC polynomial = 0x1021, init = 0xFFFF, little-endian on wire
+
+Packet Format (MCU -> Host response)
+------------------------------------
+- magic0:      0xA5
+- magic1:      0x5A
+- version:     0x01
+- command_id:  0x7F (response packet)
+- sequence:    copied from command packet
+- payload_len: M
+- payload[0]:  origin command_id
+- payload[1]:  status code
+- payload[2:]: optional data (none used right now)
+- crc16_le:    CRC16-CCITT over header+payload
+
+Command IDs
+-----------
+- 0x01 USB_CMD_GET_FRAME
+  - payload_len = 0
+  - Behavior: MCU schedules one capture request.
+  - Response packet: none required; normal frame stream is sent.
+
+- 0x02 USB_CMD_GET_STATUS
+  - payload_len = 0
+  - Behavior: MCU schedules a status line transmission.
+  - Response packet: none required; normal ASCII status line is sent.
+
+- 0x10 USB_CMD_SET_MOD_DIVIDER
+  - payload_len = 1
+  - payload[0] = divider (0..255)
+  - Response packet: yes
+
+- 0x11 USB_CMD_SET_INTEGRATION_RAW
+  - payload_len = 3
+  - payload[0] = integration slot
+  - payload[1] = integration raw LSB
+  - payload[2] = integration raw MSB
+  - integration_raw = payload[1] | (payload[2] << 8)
+  - Response packet: yes
+
+Response Status Codes
+---------------------
+- 0x00 USB_CMD_STATUS_OK
+- 0x01 USB_CMD_STATUS_BAD_LENGTH
+- 0x02 USB_CMD_STATUS_BAD_ARGUMENT
+- 0x03 USB_CMD_STATUS_REJECTED (for example, sensor power is OFF)
+- 0x04 USB_CMD_STATUS_DEVICE_ERROR
+- 0x05 USB_CMD_STATUS_UNSUPPORTED
+
+Python API (debug_interface_v2.py)
+----------------------------------
+The following helper functions are implemented in Python_Code/debug_interface_v2.py:
+
+- send_usb_command(ser, command_id, payload=b"", expect_response=False)
+- set_modulation_divider(ser, divider)
+- set_modulation_frequency_hz(ser, modulation_hz)
+- set_integration_time_raw(ser, integration_slot, integration_raw)
+
+Examples from Python side
+-------------------------
+1) Change LED modulation by divider directly:
+
+    result = set_modulation_divider(ser, 3)
+    if result["ok"]:
+        print("mod divider updated")
+
+2) Change LED modulation by target frequency:
+
+    result = set_modulation_frequency_hz(ser, 12e6)
+    if result["ok"]:
+        print("divider used:", result["divider"])
+        print("actual modulation:", result["modulation_hz_actual"])
+
+3) Change integration settings (raw format):
+
+    result = set_integration_time_raw(ser, integration_slot=2, integration_raw=38399)
+    if result["ok"]:
+        print("integration updated")
+
+Recommended usage pattern
+-------------------------
+- Pause frame capture before sending configuration commands.
+- Send one config command, wait for response, then continue.
+- If response status is not OK, do not assume settings were applied.
+
+Backward compatibility
+----------------------
+The firmware still accepts legacy single-byte commands:
+- 'G'/'g' -> capture request
+- 'S'/'s' -> status request

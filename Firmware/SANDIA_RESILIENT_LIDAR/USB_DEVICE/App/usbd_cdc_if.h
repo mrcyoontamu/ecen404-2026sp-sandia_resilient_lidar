@@ -53,6 +53,25 @@
 #define APP_TX_DATA_SIZE  2048
 /* USER CODE BEGIN EXPORTED_DEFINES */
 
+#define USB_CMD_MAGIC_0                0xA5U
+#define USB_CMD_MAGIC_1                0x5AU
+#define USB_CMD_VERSION_1              0x01U
+
+#define USB_CMD_GET_FRAME              0x01U
+#define USB_CMD_GET_STATUS             0x02U
+#define USB_CMD_SET_MOD_DIVIDER        0x10U
+#define USB_CMD_SET_INTEGRATION_RAW    0x11U
+#define USB_CMD_RESPONSE               0x7FU
+
+#define USB_CMD_STATUS_OK              0x00U
+#define USB_CMD_STATUS_BAD_LENGTH      0x01U
+#define USB_CMD_STATUS_BAD_ARGUMENT    0x02U
+#define USB_CMD_STATUS_REJECTED        0x03U
+#define USB_CMD_STATUS_DEVICE_ERROR    0x04U
+#define USB_CMD_STATUS_UNSUPPORTED     0x05U
+
+#define USB_CMD_MAX_PAYLOAD            24U
+
 /* USER CODE END EXPORTED_DEFINES */
 
 /**
@@ -65,6 +84,14 @@
   */
 
 /* USER CODE BEGIN EXPORTED_TYPES */
+
+typedef struct
+{
+  uint8_t command_id;
+  uint8_t sequence;
+  uint8_t payload_len;
+  uint8_t payload[USB_CMD_MAX_PAYLOAD];
+} usb_cmd_packet_t;
 
 /* USER CODE END EXPORTED_TYPES */
 
@@ -111,6 +138,8 @@ extern volatile uint8_t g_usb_status_request_pending;
 uint8_t CDC_Transmit_HS(uint8_t* Buf, uint16_t Len);
 
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
+
+uint8_t usb_cmd_try_dequeue(usb_cmd_packet_t* out_packet);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 
