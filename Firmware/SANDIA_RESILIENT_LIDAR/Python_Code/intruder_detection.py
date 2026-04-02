@@ -60,6 +60,24 @@ BLOB_TRIGGER_PIXELS = 220
 TEMPORAL_TRIGGER_FRAMES = 2
 MASK_BLUR_KERNEL = 11
 
+USB_CMD_MAGIC_0 = 0xA5
+USB_CMD_MAGIC_1 = 0x5A
+USB_CMD_VERSION_1 = 0x01
+USB_CMD_MAX_PAYLOAD = 24
+
+USB_CMD_SET_INTEGRATION_RAW = 0x11
+USB_CMD_RESPONSE = 0x7F
+USB_CMD_STATUS_OK = 0x00
+
+INTEGRATION_PROFILES = [
+	(2, 38399),
+	(4, 38399),
+	(6, 38399),
+	(12, 38399),
+]
+
+_usb_command_sequence = 0
+
 CMD_GET_FRAME = b"G"
 CMD_STATUS = b"S"
 
@@ -167,6 +185,172 @@ def flush_serial_input(ser):
 		log_event("RX buffer flushed")
 	except Exception as exc:
 		log_event(f"RX flush failed: {exc}")
+
+
+def crc16_ccitt(data):
+	crc = 0xFFFF
+	for byte in data:
+		crc ^= (byte << 8)
+		for _ in range(8):
+			if crc & 0x8000:
+				crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+			else:
+				crc = (crc << 1) & 0xFFFF
+	return crc
+
+
+def next_usb_command_sequence():
+	global _usb_command_sequence
+	_usb_command_sequence = (_usb_command_sequence + 1) & 0xFF
+	return _usb_command_sequence
+
+
+def build_usb_command_packet(command_id, payload=b"", sequence=None):
+	if sequence is None:
+		sequence = next_usb_command_sequence()
+
+	if len(payload) > USB_CMD_MAX_PAYLOAD:
+		raise ValueError(f"Payload too large ({len(payload)} > {USB_CMD_MAX_PAYLOAD})")
+
+	body = bytes([
+		USB_CMD_MAGIC_0,
+		USB_CMD_MAGIC_1,
+		USB_CMD_VERSION_1,
+		command_id & 0xFF,
+		sequence & 0xFF,
+		len(payload) & 0xFF,
+	]) + payload
+
+	crc = crc16_ccitt(body)
+	packet = body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+	return sequence, packet
+
+
+def read_usb_command_response(ser, timeout_s=0.30):
+	deadline = time.monotonic() + timeout_s
+	window = bytearray()
+
+	while time.monotonic() < deadline:
+		ch = ser.read(1)
+		if not ch:
+			continue
+
+		window.extend(ch)
+		if len(window) > 2:
+			window = window[-2:]
+
+		if window == bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1]):
+			header = ser.read(4)
+			if len(header) != 4:
+				continue
+
+			version, command_id, sequence, payload_len = header
+			payload_plus_crc = ser.read(payload_len + 2)
+			if len(payload_plus_crc) != (payload_len + 2):
+				continue
+
+			payload = payload_plus_crc[:payload_len]
+			crc_rx = payload_plus_crc[payload_len] | (payload_plus_crc[payload_len + 1] << 8)
+			frame_wo_crc = bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1, version, command_id, sequence, payload_len]) + payload
+			crc_calc = crc16_ccitt(frame_wo_crc)
+
+			if crc_calc != crc_rx:
+				continue
+
+			if (version != USB_CMD_VERSION_1) or (command_id != USB_CMD_RESPONSE):
+				continue
+
+			if payload_len < 2:
+				continue
+
+			return {
+				"sequence": sequence,
+				"origin_cmd": payload[0],
+				"status": payload[1],
+				"payload": payload[2:],
+			}
+
+	return None
+
+
+def send_usb_command(ser, command_id, payload=b"", expect_response=False, timeout_s=0.30):
+	sequence, packet = build_usb_command_packet(command_id, payload)
+	ser.write(packet)
+	ser.flush()
+
+	if not expect_response:
+		return {"ok": True, "sequence": sequence}
+
+	deadline = time.monotonic() + timeout_s
+	while time.monotonic() < deadline:
+		remaining = max(0.01, deadline - time.monotonic())
+		response = read_usb_command_response(ser, timeout_s=remaining)
+		if response is None:
+			continue
+
+		if response["sequence"] != sequence:
+			continue
+
+		if response["origin_cmd"] != (command_id & 0xFF):
+			continue
+
+		response["ok"] = response["status"] == USB_CMD_STATUS_OK
+		return response
+
+	return {
+		"ok": False,
+		"sequence": sequence,
+		"origin_cmd": command_id & 0xFF,
+		"status": None,
+		"payload": b"",
+	}
+
+
+def set_integration_time_raw(ser, integration_slot, integration_raw):
+	integration_slot = int(integration_slot)
+	integration_raw = int(integration_raw)
+
+	if integration_slot < 0 or integration_slot > 255:
+		raise ValueError("integration_slot must be in [0, 255]")
+	if integration_raw < 0 or integration_raw > 65535:
+		raise ValueError("integration_raw must be in [0, 65535]")
+
+	payload = bytes([
+		integration_slot & 0xFF,
+		integration_raw & 0xFF,
+		(integration_raw >> 8) & 0xFF,
+	])
+
+	return send_usb_command(
+		ser,
+		USB_CMD_SET_INTEGRATION_RAW,
+		payload=payload,
+		expect_response=True,
+		timeout_s=0.4,
+	)
+
+
+def cycle_integration_profile(ser, state):
+	next_index = (state["integration_profile_index"] + 1) % len(INTEGRATION_PROFILES)
+	slot, raw = INTEGRATION_PROFILES[next_index]
+
+	# Drop any stale bytes before waiting for a command response frame.
+	flush_serial_input(ser)
+	result = set_integration_time_raw(ser, slot, raw)
+
+	if result.get("ok", False):
+		state["integration_profile_index"] = next_index
+		state["integration_slot"] = slot
+		state["integration_raw"] = raw
+		log_event(f"Integration set: slot={slot} raw={raw}")
+	else:
+		log_event(
+			f"Integration set failed: slot={slot} raw={raw} status={result.get('status')}"
+		)
+
+	# Keep stream parser in a clean state after config response traffic.
+	flush_serial_input(ser)
+	return result
 
 
 def send_command(ser, cmd):
@@ -399,7 +583,7 @@ def draw_overlay(display_bgr, state):
 
 	cv2.putText(
 		view,
-		"keys: q quit | space pause | s save | b bg capture | r rearm",
+		"keys: q quit | space pause | s save | b bg capture | r rearm | i integration",
 		(10, 55),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.48,
@@ -407,9 +591,14 @@ def draw_overlay(display_bgr, state):
 		1,
 	)
 
+	if state["integration_slot"] is None:
+		int_text = "integration: not set (press i)"
+	else:
+		int_text = f"integration: slot {state['integration_slot']} raw {state['integration_raw']}"
+
 	cv2.putText(
 		view,
-		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']}",
+		int_text,
 		(10, 75),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.50,
@@ -419,8 +608,18 @@ def draw_overlay(display_bgr, state):
 
 	cv2.putText(
 		view,
-		f"blob_trigger={BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
+		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']}",
 		(10, 95),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.50,
+		(255, 255, 255),
+		1,
+	)
+
+	cv2.putText(
+		view,
+		f"blob_trigger={BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
+		(10, 115),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.50,
 		(255, 255, 255),
@@ -431,7 +630,7 @@ def draw_overlay(display_bgr, state):
 		cv2.putText(
 			view,
 			f"triggered_at={state['trigger_timestamp']}",
-			(10, 115),
+			(10, 135),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.50,
 			(255, 255, 255),
@@ -502,6 +701,9 @@ def main():
 		"trigger_counter": 0,
 		"triggered": False,
 		"trigger_timestamp": None,
+		"integration_profile_index": -1,
+		"integration_slot": None,
+		"integration_raw": None,
 	}
 
 	ser = None
@@ -582,6 +784,8 @@ def main():
 					capture_background(state)
 				if key == ord("r"):
 					rearm_detection(state)
+				if key == ord("i"):
+					cycle_integration_profile(ser, state)
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")
