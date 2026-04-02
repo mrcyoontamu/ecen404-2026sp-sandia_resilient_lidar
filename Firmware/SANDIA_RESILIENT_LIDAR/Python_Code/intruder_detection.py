@@ -29,8 +29,8 @@ DEFAULT_MODULATION_HZ = 24e6
 MODULATION_HZ = DEFAULT_MODULATION_HZ
 SPEED_OF_LIGHT_M_PER_S = 299792458.0
 
-# Datasheet 9.2.2 guidance: amplitudes below ~25 LSB are not useful for distance.
-AMPLITUDE_MIN_LSB = 25.0
+# Datasheet 9.2.2 guidance: amplitudes below this LSB threshold are not useful for distance.
+AMPLITUDE_MIN_LSB = 35.0
 
 # Distance offset (DOFFSET in datasheet equation [2]). Keep 0 until calibrated.
 DISTANCE_OFFSET_M = -1.8288
@@ -52,34 +52,65 @@ EXCLUDED_KEYWORDS = ("stlink", "st-link", "debugger")
 # Display options.
 WINDOW_NAME = "Intruder Detection"
 DISPLAY_SCALE = 3
+SHOW_FILTER_WORKFLOW = True
 
 # Intruder algorithm tuning.
 DIFF_THRESHOLD_M = 0.1
 MIN_BLOB_AREA_PIXELS = 80
-BLOB_TRIGGER_PIXELS = 220
-TEMPORAL_TRIGGER_FRAMES = 2
+BLOB_TRIGGER_PIXELS = 120
+TEMPORAL_TRIGGER_FRAMES = 1
 MASK_BLUR_KERNEL = 11
+ENABLE_MASK_BLUR = True
+ENABLE_DEPTH_PRE_FILTER = True
+DEPTH_FILTER_KERNEL = 11
 
-USB_CMD_MAGIC_0 = 0xA5
-USB_CMD_MAGIC_1 = 0x5A
-USB_CMD_VERSION_1 = 0x01
-USB_CMD_MAX_PAYLOAD = 24
-
-USB_CMD_SET_INTEGRATION_RAW = 0x11
-USB_CMD_RESPONSE = 0x7F
-USB_CMD_STATUS_OK = 0x00
-
-INTEGRATION_PROFILES = [
-	(2, 38399),
-	(4, 38399),
-	(6, 38399),
-	(12, 38399),
-]
-
-_usb_command_sequence = 0
+# Kalman smoothing for largest contiguous blob area (pixels).
+ENABLE_KALMAN = True
+KALMAN_USE_FOR_TRIGGER = True
+KALMAN_MAX_MISSED_FRAMES = 8
+KALMAN_PROCESS_NOISE = 8
+KALMAN_MEASUREMENT_NOISE = 300
 
 CMD_GET_FRAME = b"G"
 CMD_STATUS = b"S"
+
+
+def create_blob_area_kalman(initial_area_pixels):
+	kf = cv2.KalmanFilter(2, 1)
+	kf.transitionMatrix = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float32)
+	kf.measurementMatrix = np.array([[1.0, 0.0]], dtype=np.float32)
+	kf.processNoiseCov = np.array(
+		[[KALMAN_PROCESS_NOISE, 0.0], [0.0, KALMAN_PROCESS_NOISE]],
+		dtype=np.float32,
+	)
+	kf.measurementNoiseCov = np.array([[KALMAN_MEASUREMENT_NOISE]], dtype=np.float32)
+	kf.errorCovPost = np.eye(2, dtype=np.float32) * 1.0
+	kf.statePre = np.array([[float(initial_area_pixels)], [0.0]], dtype=np.float32)
+	kf.statePost = np.array([[float(initial_area_pixels)], [0.0]], dtype=np.float32)
+	return kf
+
+
+def draw_outlined_text(img, text, org, font_scale=0.50, thickness=1):
+	cv2.putText(
+		img,
+		text,
+		org,
+		cv2.FONT_HERSHEY_SIMPLEX,
+		font_scale,
+		(0, 0, 0),
+		thickness + 2,
+		cv2.LINE_AA,
+	)
+	cv2.putText(
+		img,
+		text,
+		org,
+		cv2.FONT_HERSHEY_SIMPLEX,
+		font_scale,
+		(255, 255, 255),
+		thickness,
+		cv2.LINE_AA,
+	)
 
 
 def list_available_ports():
@@ -185,172 +216,6 @@ def flush_serial_input(ser):
 		log_event("RX buffer flushed")
 	except Exception as exc:
 		log_event(f"RX flush failed: {exc}")
-
-
-def crc16_ccitt(data):
-	crc = 0xFFFF
-	for byte in data:
-		crc ^= (byte << 8)
-		for _ in range(8):
-			if crc & 0x8000:
-				crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-			else:
-				crc = (crc << 1) & 0xFFFF
-	return crc
-
-
-def next_usb_command_sequence():
-	global _usb_command_sequence
-	_usb_command_sequence = (_usb_command_sequence + 1) & 0xFF
-	return _usb_command_sequence
-
-
-def build_usb_command_packet(command_id, payload=b"", sequence=None):
-	if sequence is None:
-		sequence = next_usb_command_sequence()
-
-	if len(payload) > USB_CMD_MAX_PAYLOAD:
-		raise ValueError(f"Payload too large ({len(payload)} > {USB_CMD_MAX_PAYLOAD})")
-
-	body = bytes([
-		USB_CMD_MAGIC_0,
-		USB_CMD_MAGIC_1,
-		USB_CMD_VERSION_1,
-		command_id & 0xFF,
-		sequence & 0xFF,
-		len(payload) & 0xFF,
-	]) + payload
-
-	crc = crc16_ccitt(body)
-	packet = body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-	return sequence, packet
-
-
-def read_usb_command_response(ser, timeout_s=0.30):
-	deadline = time.monotonic() + timeout_s
-	window = bytearray()
-
-	while time.monotonic() < deadline:
-		ch = ser.read(1)
-		if not ch:
-			continue
-
-		window.extend(ch)
-		if len(window) > 2:
-			window = window[-2:]
-
-		if window == bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1]):
-			header = ser.read(4)
-			if len(header) != 4:
-				continue
-
-			version, command_id, sequence, payload_len = header
-			payload_plus_crc = ser.read(payload_len + 2)
-			if len(payload_plus_crc) != (payload_len + 2):
-				continue
-
-			payload = payload_plus_crc[:payload_len]
-			crc_rx = payload_plus_crc[payload_len] | (payload_plus_crc[payload_len + 1] << 8)
-			frame_wo_crc = bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1, version, command_id, sequence, payload_len]) + payload
-			crc_calc = crc16_ccitt(frame_wo_crc)
-
-			if crc_calc != crc_rx:
-				continue
-
-			if (version != USB_CMD_VERSION_1) or (command_id != USB_CMD_RESPONSE):
-				continue
-
-			if payload_len < 2:
-				continue
-
-			return {
-				"sequence": sequence,
-				"origin_cmd": payload[0],
-				"status": payload[1],
-				"payload": payload[2:],
-			}
-
-	return None
-
-
-def send_usb_command(ser, command_id, payload=b"", expect_response=False, timeout_s=0.30):
-	sequence, packet = build_usb_command_packet(command_id, payload)
-	ser.write(packet)
-	ser.flush()
-
-	if not expect_response:
-		return {"ok": True, "sequence": sequence}
-
-	deadline = time.monotonic() + timeout_s
-	while time.monotonic() < deadline:
-		remaining = max(0.01, deadline - time.monotonic())
-		response = read_usb_command_response(ser, timeout_s=remaining)
-		if response is None:
-			continue
-
-		if response["sequence"] != sequence:
-			continue
-
-		if response["origin_cmd"] != (command_id & 0xFF):
-			continue
-
-		response["ok"] = response["status"] == USB_CMD_STATUS_OK
-		return response
-
-	return {
-		"ok": False,
-		"sequence": sequence,
-		"origin_cmd": command_id & 0xFF,
-		"status": None,
-		"payload": b"",
-	}
-
-
-def set_integration_time_raw(ser, integration_slot, integration_raw):
-	integration_slot = int(integration_slot)
-	integration_raw = int(integration_raw)
-
-	if integration_slot < 0 or integration_slot > 255:
-		raise ValueError("integration_slot must be in [0, 255]")
-	if integration_raw < 0 or integration_raw > 65535:
-		raise ValueError("integration_raw must be in [0, 65535]")
-
-	payload = bytes([
-		integration_slot & 0xFF,
-		integration_raw & 0xFF,
-		(integration_raw >> 8) & 0xFF,
-	])
-
-	return send_usb_command(
-		ser,
-		USB_CMD_SET_INTEGRATION_RAW,
-		payload=payload,
-		expect_response=True,
-		timeout_s=0.4,
-	)
-
-
-def cycle_integration_profile(ser, state):
-	next_index = (state["integration_profile_index"] + 1) % len(INTEGRATION_PROFILES)
-	slot, raw = INTEGRATION_PROFILES[next_index]
-
-	# Drop any stale bytes before waiting for a command response frame.
-	flush_serial_input(ser)
-	result = set_integration_time_raw(ser, slot, raw)
-
-	if result.get("ok", False):
-		state["integration_profile_index"] = next_index
-		state["integration_slot"] = slot
-		state["integration_raw"] = raw
-		log_event(f"Integration set: slot={slot} raw={raw}")
-	else:
-		log_event(
-			f"Integration set failed: slot={slot} raw={raw} status={result.get('status')}"
-		)
-
-	# Keep stream parser in a clean state after config response traffic.
-	flush_serial_input(ser)
-	return result
 
 
 def send_command(ser, cmd):
@@ -480,29 +345,65 @@ def depth_to_colormap(depth_m, invalid_mask, max_depth_m):
 	return bgr
 
 
+def filter_depth_for_detection(depth_m):
+	filtered = depth_m.copy()
+	if not ENABLE_DEPTH_PRE_FILTER:
+		return filtered
+
+	kernel_size = max(0, int(DEPTH_FILTER_KERNEL))
+	if kernel_size <= 1:
+		return filtered
+	if kernel_size % 2 == 0:
+		kernel_size += 1
+
+	valid_mask = np.isfinite(filtered)
+	depth_f32 = np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+	weights = valid_mask.astype(np.float32)
+	kernel = np.ones((kernel_size, kernel_size), dtype=np.float32)
+
+	depth_sum = cv2.filter2D(depth_f32, -1, kernel, borderType=cv2.BORDER_REFLECT)
+	weight_sum = cv2.filter2D(weights, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+	blurred = depth_f32.copy()
+	has_support = weight_sum > 0.0
+	blurred[has_support] = depth_sum[has_support] / weight_sum[has_support]
+	blurred[~valid_mask] = np.nan
+	return blurred
+
+
 def update_intruder_detection(state, depth_m, invalid_mask):
-	depth_for_model = depth_m.copy()
+	depth_for_model = filter_depth_for_detection(depth_m)
 	depth_for_model[invalid_mask] = np.nan
+	state["depth_filtered_m"] = depth_for_model.copy()
 
 	valid_mask = np.isfinite(depth_for_model)
 	fg_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
+	candidate_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
+	post_blur_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
+	diff_for_display_m = None
+	trigger_metric = 0.0
 
 	if state["ref_depth_m"] is not None:
 		ref = state["ref_depth_m"]
 		diff = np.abs(depth_for_model - ref)
+		diff_for_display_m = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 		# Treat validity transitions as foreground events.
 		bg_valid_mask = np.isfinite(ref)
 		bg_invalid_now_valid = (~bg_valid_mask) & valid_mask
 		now_invalid_bg_valid = bg_valid_mask & (~valid_mask)
 		candidate = (valid_mask & bg_valid_mask & (diff >= DIFF_THRESHOLD_M)) | bg_invalid_now_valid | now_invalid_bg_valid
-		fg_mask[candidate] = 255
+		candidate_mask[candidate] = 255
+		fg_mask = candidate_mask.copy()
 
-		blur_kernel = max(1, int(MASK_BLUR_KERNEL))
-		if blur_kernel % 2 == 0:
-			blur_kernel += 1
-		if blur_kernel > 1:
-			fg_mask = cv2.medianBlur(fg_mask, blur_kernel)
+		blur_kernel = max(0, int(MASK_BLUR_KERNEL))
+		if ENABLE_MASK_BLUR and blur_kernel > 0:
+			if blur_kernel % 2 == 0:
+				blur_kernel += 1
+			if blur_kernel > 1:
+				fg_mask = cv2.medianBlur(fg_mask, blur_kernel)
+
+		post_blur_mask = fg_mask.copy()
 
 		# Keep only contiguous blobs above the minimum area so scattered noise
 		# in distant regions cannot add up to a trigger.
@@ -519,7 +420,33 @@ def update_intruder_detection(state, depth_m, invalid_mask):
 		fg_mask = filtered_mask
 		foreground_pixels = int(np.count_nonzero(fg_mask))
 
-		if largest_blob_pixels >= BLOB_TRIGGER_PIXELS:
+		if ENABLE_KALMAN:
+			if largest_blob_pixels > 0:
+				if state["blob_area_kf"] is None:
+					state["blob_area_kf"] = create_blob_area_kalman(largest_blob_pixels)
+				state["blob_area_kf"].predict()
+				measurement = np.array([[float(largest_blob_pixels)]], dtype=np.float32)
+				corrected = state["blob_area_kf"].correct(measurement)
+				state["smoothed_blob_pixels"] = max(0.0, float(corrected[0, 0]))
+				state["blob_missed_frames"] = 0
+			elif state["blob_area_kf"] is not None:
+				predicted = state["blob_area_kf"].predict()
+				state["smoothed_blob_pixels"] = max(0.0, float(predicted[0, 0]))
+				state["blob_missed_frames"] += 1
+				if state["blob_missed_frames"] > KALMAN_MAX_MISSED_FRAMES:
+					state["blob_area_kf"] = None
+					state["smoothed_blob_pixels"] = 0.0
+					state["blob_missed_frames"] = 0
+			else:
+				state["smoothed_blob_pixels"] = 0.0
+		else:
+			state["blob_area_kf"] = None
+			state["blob_missed_frames"] = 0
+			state["smoothed_blob_pixels"] = float(largest_blob_pixels)
+
+		trigger_metric = state["smoothed_blob_pixels"] if (ENABLE_KALMAN and KALMAN_USE_FOR_TRIGGER) else float(largest_blob_pixels)
+
+		if trigger_metric >= BLOB_TRIGGER_PIXELS:
 			state["trigger_counter"] += 1
 		else:
 			state["trigger_counter"] = 0
@@ -532,10 +459,17 @@ def update_intruder_detection(state, depth_m, invalid_mask):
 		foreground_pixels = 0
 		largest_blob_pixels = 0
 		state["trigger_counter"] = 0
+		state["blob_area_kf"] = None
+		state["blob_missed_frames"] = 0
+		state["smoothed_blob_pixels"] = 0.0
 
 	state["fg_mask"] = fg_mask
+	state["candidate_mask"] = candidate_mask
+	state["post_blur_mask"] = post_blur_mask
+	state["diff_m"] = diff_for_display_m
 	state["foreground_pixels"] = foreground_pixels
 	state["largest_blob_pixels"] = largest_blob_pixels
+	state["trigger_metric_pixels"] = trigger_metric if state["ref_depth_m"] is not None else 0.0
 
 
 def rearm_detection(state):
@@ -544,8 +478,15 @@ def rearm_detection(state):
 	state["trigger_timestamp"] = None
 	state["ref_depth_m"] = None
 	state["fg_mask"] = None
+	state["candidate_mask"] = None
+	state["post_blur_mask"] = None
+	state["diff_m"] = None
 	state["foreground_pixels"] = 0
 	state["largest_blob_pixels"] = 0
+	state["smoothed_blob_pixels"] = 0.0
+	state["trigger_metric_pixels"] = 0.0
+	state["blob_area_kf"] = None
+	state["blob_missed_frames"] = 0
 	log_event("System rearmed. Press 'b' to capture a new background.")
 
 
@@ -554,11 +495,87 @@ def capture_background(state):
 		log_event("No frame available yet to capture background.")
 		return
 
-	state["ref_depth_m"] = state["depth_m"].copy()
+	if state["depth_filtered_m"] is not None:
+		state["ref_depth_m"] = state["depth_filtered_m"].copy()
+	else:
+		state["ref_depth_m"] = filter_depth_for_detection(state["depth_m"])
 	state["trigger_counter"] = 0
 	state["triggered"] = False
 	state["trigger_timestamp"] = None
-	log_event("Background captured")
+	log_event("Background captured (filtered depth reference)")
+
+
+def make_mask_bgr(mask):
+	if mask is None:
+		return np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+	gray = mask.astype(np.uint8)
+	return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def make_diff_bgr(diff_m):
+	if diff_m is None:
+		return np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+	norm = np.clip(diff_m / max(DIFF_THRESHOLD_M * 3.0, 1e-6), 0.0, 1.0)
+	gray = (norm * 255.0).astype(np.uint8)
+	return cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
+
+
+def label_panel(panel_bgr, text):
+	draw_outlined_text(panel_bgr, text, (8, 20), font_scale=0.55, thickness=1)
+	return panel_bgr
+
+
+def build_workflow_view(depth_bgr, state):
+	depth_panel = label_panel(depth_bgr.copy(), "Depth")
+	diff_panel = label_panel(make_diff_bgr(state["diff_m"]), "|Depth - Background|")
+	candidate_panel = label_panel(make_mask_bgr(state["candidate_mask"]), "Threshold Candidate")
+	blur_panel = label_panel(make_mask_bgr(state["post_blur_mask"]), "After Mask Blur")
+	blob_panel = label_panel(make_mask_bgr(state["fg_mask"]), "Blob Filtered")
+	overlay_panel = depth_bgr.copy()
+	if state["fg_mask"] is not None:
+		overlay_panel[state["fg_mask"] > 0] = (0, 0, 255)
+	overlay_panel = label_panel(overlay_panel, "Final Overlay")
+
+	row1 = np.hstack((depth_panel, diff_panel, candidate_panel))
+	row2 = np.hstack((blur_panel, blob_panel, overlay_panel))
+	return np.vstack((row1, row2))
+
+
+def on_mouse(event, x, y, flags, state):
+	del flags
+	if event != cv2.EVENT_LBUTTONDOWN:
+		return
+
+	depth_m = state["depth_m"]
+	if depth_m is None:
+		return
+
+	if state["show_workflow"]:
+		if x < 0 or x >= (FRAME_WIDTH * 3) or y < 0 or y >= (FRAME_HEIGHT * 2):
+			return
+		u = x % FRAME_WIDTH
+		v = y % FRAME_HEIGHT
+	else:
+		u = x // DISPLAY_SCALE
+		v = y // DISPLAY_SCALE
+		if u < 0 or u >= FRAME_WIDTH or v < 0 or v >= FRAME_HEIGHT:
+			return
+
+	state["clicked_uv"] = (u, v)
+	d = depth_m[v, u]
+	p = state["phase_rad"][v, u]
+	f0 = int(state["dcs_frames"][0][v, u])
+	f1 = int(state["dcs_frames"][1][v, u])
+	f2 = int(state["dcs_frames"][2][v, u])
+	f3 = int(state["dcs_frames"][3][v, u])
+
+	if np.isnan(d):
+		print(f"Click ({u}, {v}) -> invalid/saturated pixel")
+	else:
+		print(
+			f"Click ({u}, {v}) -> depth={d:.4f} m ({d * 3.28084:.3f} ft), "
+			f"phase={p:.4f} rad, DCS=[{f0}, {f1}, {f2}, {f3}]"
+		)
 
 
 def draw_overlay(display_bgr, state):
@@ -567,7 +584,7 @@ def draw_overlay(display_bgr, state):
 	base = "PAUSED" if state["paused"] else "LIVE"
 	mode = "ARMED" if state["ref_depth_m"] is not None else "UNARMED"
 	status = f"{base} | {mode}"
-	cv2.putText(view, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+	draw_outlined_text(view, status, (10, 25), font_scale=0.7, thickness=2)
 
 	if state["triggered"]:
 		cv2.rectangle(view, (0, 0), (view.shape[1], 40), (0, 0, 255), -1)
@@ -581,63 +598,48 @@ def draw_overlay(display_bgr, state):
 			2,
 		)
 
-	cv2.putText(
+	draw_outlined_text(
 		view,
-		"keys: q quit | space pause | s save | b bg capture | r rearm | i integration",
+		"keys: q quit | space pause | s save | b bg capture | r rearm | w workflow",
 		(10, 55),
-		cv2.FONT_HERSHEY_SIMPLEX,
-		0.48,
-		(255, 255, 255),
-		1,
+		font_scale=0.48,
+		thickness=1,
 	)
 
-	if state["integration_slot"] is None:
-		int_text = "integration: not set (press i)"
-	else:
-		int_text = f"integration: slot {state['integration_slot']} raw {state['integration_raw']}"
-
-	cv2.putText(
+	draw_outlined_text(
 		view,
-		int_text,
+		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']} smooth_blob={state['smoothed_blob_pixels']:.1f}",
 		(10, 75),
-		cv2.FONT_HERSHEY_SIMPLEX,
-		0.50,
-		(255, 255, 255),
-		1,
+		font_scale=0.50,
+		thickness=1,
 	)
 
-	cv2.putText(
+	draw_outlined_text(
 		view,
-		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']}",
+		f"trigger={state['trigger_metric_pixels']:.1f}/{BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
 		(10, 95),
-		cv2.FONT_HERSHEY_SIMPLEX,
-		0.50,
-		(255, 255, 255),
-		1,
+		font_scale=0.50,
+		thickness=1,
 	)
 
-	cv2.putText(
+	draw_outlined_text(
 		view,
-		f"blob_trigger={BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
+		f"depth_filter={'on' if ENABLE_DEPTH_PRE_FILTER else 'off'}({DEPTH_FILTER_KERNEL}) mask_blur={'on' if ENABLE_MASK_BLUR else 'off'}({MASK_BLUR_KERNEL}) kalman={'on' if ENABLE_KALMAN else 'off'}",
 		(10, 115),
-		cv2.FONT_HERSHEY_SIMPLEX,
-		0.50,
-		(255, 255, 255),
-		1,
+		font_scale=0.50,
+		thickness=1,
 	)
 
 	if state["trigger_timestamp"] is not None:
-		cv2.putText(
+		draw_outlined_text(
 			view,
 			f"triggered_at={state['trigger_timestamp']}",
 			(10, 135),
-			cv2.FONT_HERSHEY_SIMPLEX,
-			0.50,
-			(255, 255, 255),
-			1,
+			font_scale=0.50,
+			thickness=1,
 		)
 
-	if state["fg_mask"] is not None:
+	if (not state["show_workflow"]) and state["fg_mask"] is not None:
 		mask_small = cv2.resize(
 			state["fg_mask"],
 			(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
@@ -645,6 +647,15 @@ def draw_overlay(display_bgr, state):
 		)
 		# Highlight detected foreground in red over the depth map.
 		view[mask_small > 0] = (0, 0, 255)
+
+	if state["clicked_uv"] is not None and state["depth_m"] is not None:
+		u, v = state["clicked_uv"]
+		d = state["depth_m"][v, u]
+		if np.isnan(d):
+			click_text = f"click ({u},{v}) invalid"
+		else:
+			click_text = f"click ({u},{v}) depth={d:.3f} m / {d * 3.28084:.3f} ft"
+		draw_outlined_text(view, click_text, (10, 155), font_scale=0.52, thickness=1)
 
 	return view
 
@@ -669,6 +680,7 @@ def save_snapshot(state):
 		depth_m=state["depth_m"],
 		ref_depth_m=state["ref_depth_m"],
 		fg_mask=state["fg_mask"],
+		smoothed_blob_pixels=state["smoothed_blob_pixels"],
 		triggered=state["triggered"],
 		modulation_hz=state["modulation_hz"],
 	)
@@ -681,30 +693,65 @@ def save_snapshot(state):
 	print(f"Saved: {png_path}")
 
 
+def resize_for_view_mode(show_workflow):
+	if show_workflow:
+		cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH * 3, FRAME_HEIGHT * 2)
+	else:
+		cv2.resizeWindow(
+			WINDOW_NAME,
+			FRAME_WIDTH * DISPLAY_SCALE,
+			FRAME_HEIGHT * DISPLAY_SCALE,
+		)
+
+
+def rebuild_display_from_state(state):
+	if state["depth_m"] is None:
+		return
+
+	invalid_mask = ~np.isfinite(state["depth_m"])
+	depth_bgr = depth_to_colormap(state["depth_m"], invalid_mask, state["max_depth_m"])
+	if state["show_workflow"]:
+		state["display_bgr"] = build_workflow_view(depth_bgr, state)
+	else:
+		state["display_bgr"] = cv2.resize(
+			depth_bgr,
+			(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
+			interpolation=cv2.INTER_NEAREST,
+		)
+
+
 def main():
 	cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-	cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE)
+	resize_for_view_mode(SHOW_FILTER_WORKFLOW)
 
 	state = {
 		"paused": False,
+		"show_workflow": SHOW_FILTER_WORKFLOW,
+		"clicked_uv": None,
 		"dcs_frames": None,
 		"phase_rad": None,
 		"depth_m": None,
+		"depth_filtered_m": None,
 		"display_bgr": None,
 		"modulation_hz": MODULATION_HZ,
 		"max_depth_m": MAX_DEPTH_M,
 		"depth_scale_m_per_rad": DEPTH_SCALE_M_PER_RAD,
 		"ref_depth_m": None,
 		"fg_mask": None,
+		"candidate_mask": None,
+		"post_blur_mask": None,
+		"diff_m": None,
 		"foreground_pixels": 0,
 		"largest_blob_pixels": 0,
+		"smoothed_blob_pixels": 0.0,
+		"trigger_metric_pixels": 0.0,
+		"blob_area_kf": None,
+		"blob_missed_frames": 0,
 		"trigger_counter": 0,
 		"triggered": False,
 		"trigger_timestamp": None,
-		"integration_profile_index": -1,
-		"integration_slot": None,
-		"integration_raw": None,
 	}
+	cv2.setMouseCallback(WINDOW_NAME, on_mouse, state)
 
 	ser = None
 	next_status_poll = 0.0
@@ -754,12 +801,15 @@ def main():
 
 					update_intruder_detection(state, depth_m, invalid_mask)
 
-					display_bgr = depth_to_colormap(depth_m, invalid_mask, state["max_depth_m"])
-					display_bgr = cv2.resize(
-						display_bgr,
-						(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
-						interpolation=cv2.INTER_NEAREST,
-					)
+					depth_bgr = depth_to_colormap(depth_m, invalid_mask, state["max_depth_m"])
+					if state["show_workflow"]:
+						display_bgr = build_workflow_view(depth_bgr, state)
+					else:
+						display_bgr = cv2.resize(
+							depth_bgr,
+							(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
+							interpolation=cv2.INTER_NEAREST,
+						)
 
 					state["dcs_frames"] = dcs_frames
 					state["phase_rad"] = phase_rad
@@ -784,8 +834,11 @@ def main():
 					capture_background(state)
 				if key == ord("r"):
 					rearm_detection(state)
-				if key == ord("i"):
-					cycle_integration_profile(ser, state)
+				if key == ord("w"):
+					state["show_workflow"] = not state["show_workflow"]
+					resize_for_view_mode(state["show_workflow"])
+					rebuild_display_from_state(state)
+					log_event("Workflow view ON" if state["show_workflow"] else "Workflow view OFF")
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")
