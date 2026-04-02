@@ -53,8 +53,27 @@ EXCLUDED_KEYWORDS = ("stlink", "st-link", "debugger")
 WINDOW_NAME = "Depth Debug Interface v2"
 DISPLAY_SCALE = 3
 
-CMD_GET_FRAME = b"G"
-CMD_STATUS = b"S"
+USB_CMD_MAGIC_0 = 0xA5
+USB_CMD_MAGIC_1 = 0x5A
+USB_CMD_VERSION_1 = 0x01
+USB_CMD_MAX_PAYLOAD = 24
+
+USB_CMD_GET_FRAME = 0x01
+USB_CMD_GET_STATUS = 0x02
+USB_CMD_SET_MOD_DIVIDER = 0x10
+USB_CMD_SET_INTEGRATION_RAW = 0x11
+USB_CMD_RESPONSE = 0x7F
+
+USB_CMD_STATUS_OK = 0x00
+
+INTEGRATION_PROFILES = [
+	(2, 38399),
+	(4, 38399),
+	(6, 38399),
+	(12, 38399),
+]
+
+_usb_command_sequence = 0
 
 
 def draw_outlined_text(img, text, org, font_scale=0.55, thickness=1):
@@ -186,9 +205,196 @@ def flush_serial_input(ser):
 		log_event(f"RX flush failed: {exc}")
 
 
-def send_command(ser, cmd):
-	ser.write(cmd)
+def crc16_ccitt(data):
+	crc = 0xFFFF
+	for byte in data:
+		crc ^= (byte << 8)
+		for _ in range(8):
+			if crc & 0x8000:
+				crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+			else:
+				crc = (crc << 1) & 0xFFFF
+	return crc
+
+
+def next_usb_command_sequence():
+	global _usb_command_sequence
+	_usb_command_sequence = (_usb_command_sequence + 1) & 0xFF
+	return _usb_command_sequence
+
+
+def build_usb_command_packet(command_id, payload=b"", sequence=None):
+	if sequence is None:
+		sequence = next_usb_command_sequence()
+
+	if len(payload) > USB_CMD_MAX_PAYLOAD:
+		raise ValueError(f"Payload too large ({len(payload)} > {USB_CMD_MAX_PAYLOAD})")
+
+	body = bytes([
+		USB_CMD_MAGIC_0,
+		USB_CMD_MAGIC_1,
+		USB_CMD_VERSION_1,
+		command_id & 0xFF,
+		sequence & 0xFF,
+		len(payload) & 0xFF,
+	]) + payload
+
+	crc = crc16_ccitt(body)
+	packet = body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+	return sequence, packet
+
+
+def read_usb_command_response(ser, timeout_s=0.30):
+	deadline = time.monotonic() + timeout_s
+	window = bytearray()
+
+	while time.monotonic() < deadline:
+		ch = ser.read(1)
+		if not ch:
+			continue
+
+		window.extend(ch)
+		if len(window) > 2:
+			window = window[-2:]
+
+		if window == bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1]):
+			header = ser.read(4)
+			if len(header) != 4:
+				continue
+
+			version, command_id, sequence, payload_len = header
+			payload_plus_crc = ser.read(payload_len + 2)
+			if len(payload_plus_crc) != (payload_len + 2):
+				continue
+
+			payload = payload_plus_crc[:payload_len]
+			crc_rx = payload_plus_crc[payload_len] | (payload_plus_crc[payload_len + 1] << 8)
+			frame_wo_crc = bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1, version, command_id, sequence, payload_len]) + payload
+			crc_calc = crc16_ccitt(frame_wo_crc)
+
+			if crc_calc != crc_rx:
+				continue
+
+			if (version != USB_CMD_VERSION_1) or (command_id != USB_CMD_RESPONSE):
+				continue
+
+			if payload_len < 2:
+				continue
+
+			return {
+				"sequence": sequence,
+				"origin_cmd": payload[0],
+				"status": payload[1],
+				"payload": payload[2:],
+			}
+
+	return None
+
+
+def send_usb_command(ser, command_id, payload=b"", expect_response=False, timeout_s=0.30):
+	sequence, packet = build_usb_command_packet(command_id, payload)
+	ser.write(packet)
 	ser.flush()
+
+	if not expect_response:
+		return {"ok": True, "sequence": sequence}
+
+	deadline = time.monotonic() + timeout_s
+	while time.monotonic() < deadline:
+		remaining = max(0.01, deadline - time.monotonic())
+		response = read_usb_command_response(ser, timeout_s=remaining)
+		if response is None:
+			continue
+
+		if response["sequence"] != sequence:
+			continue
+
+		if response["origin_cmd"] != (command_id & 0xFF):
+			continue
+
+		response["ok"] = response["status"] == USB_CMD_STATUS_OK
+		return response
+
+	return {
+		"ok": False,
+		"sequence": sequence,
+		"origin_cmd": command_id & 0xFF,
+		"status": None,
+		"payload": b"",
+	}
+
+
+def set_modulation_divider(ser, divider):
+	divider = int(divider)
+	if divider < 0 or divider > 255:
+		raise ValueError("divider must be in [0, 255]")
+
+	return send_usb_command(
+		ser,
+		USB_CMD_SET_MOD_DIVIDER,
+		payload=bytes([divider]),
+		expect_response=True,
+		timeout_s=0.4,
+	)
+
+
+def set_modulation_frequency_hz(ser, modulation_hz):
+	if modulation_hz <= 0.0:
+		raise ValueError("modulation_hz must be > 0")
+
+	divider = int(round((96e6 / (4.0 * float(modulation_hz))) - 1.0))
+	divider = max(0, min(255, divider))
+	result = set_modulation_divider(ser, divider)
+	result["divider"] = divider
+	result["modulation_hz_actual"] = modulation_hz_from_divider(divider)
+	return result
+
+
+def set_integration_time_raw(ser, integration_slot, integration_raw):
+	integration_slot = int(integration_slot)
+	integration_raw = int(integration_raw)
+
+	if integration_slot < 0 or integration_slot > 255:
+		raise ValueError("integration_slot must be in [0, 255]")
+	if integration_raw < 0 or integration_raw > 65535:
+		raise ValueError("integration_raw must be in [0, 65535]")
+
+	payload = bytes([
+		integration_slot & 0xFF,
+		integration_raw & 0xFF,
+		(integration_raw >> 8) & 0xFF,
+	])
+
+	return send_usb_command(
+		ser,
+		USB_CMD_SET_INTEGRATION_RAW,
+		payload=payload,
+		expect_response=True,
+		timeout_s=0.4,
+	)
+
+
+def cycle_integration_profile(ser, state):
+	next_index = (state["integration_profile_index"] + 1) % len(INTEGRATION_PROFILES)
+	slot, raw = INTEGRATION_PROFILES[next_index]
+
+	# Drop any stale bytes before waiting for a command response frame.
+	flush_serial_input(ser)
+	result = set_integration_time_raw(ser, slot, raw)
+
+	if result.get("ok", False):
+		state["integration_profile_index"] = next_index
+		state["integration_slot"] = slot
+		state["integration_raw"] = raw
+		log_event(f"Integration set: slot={slot} raw={raw}")
+	else:
+		log_event(
+			f"Integration set failed: slot={slot} raw={raw} status={result.get('status')}"
+		)
+
+	# Keep stream parser in a clean state after config response traffic.
+	flush_serial_input(ser)
+	return result
 
 
 def compute_depth_params(modulation_hz):
@@ -278,7 +484,7 @@ def read_dcs_quad(ser):
 
 
 def request_one_dcs_quad(ser):
-	send_command(ser, CMD_GET_FRAME)
+	send_usb_command(ser, USB_CMD_GET_FRAME)
 	return read_dcs_quad(ser)
 
 
@@ -398,7 +604,13 @@ def draw_overlay(display_bgr, state):
 		font_scale=0.52,
 		thickness=1,
 	)
-	draw_outlined_text(view, "keys: q quit | space pause | s save", (10, 72), font_scale=0.5, thickness=1)
+	draw_outlined_text(view, "keys: q quit | space pause | s save | i cycle integration", (10, 72), font_scale=0.5, thickness=1)
+
+	if state["integration_slot"] is None:
+		int_text = "integration: not set (press i)"
+	else:
+		int_text = f"integration: slot {state['integration_slot']} raw {state['integration_raw']}"
+	draw_outlined_text(view, int_text, (10, 95), font_scale=0.52, thickness=1)
 
 	if state["clicked_uv"] is not None and state["depth_m"] is not None:
 		u, v = state["clicked_uv"]
@@ -411,7 +623,7 @@ def draw_overlay(display_bgr, state):
 			text = f"({u},{v}) invalid"
 		else:
 			text = f"({u},{v}) {d:.3f} m / {d * 3.28084:.3f} ft"
-		draw_outlined_text(view, text, (10, 98), font_scale=0.55, thickness=2)
+		draw_outlined_text(view, text, (10, 118), font_scale=0.55, thickness=2)
 
 	return view
 
@@ -433,6 +645,9 @@ def main():
 		"fps": 0.0,
 		"fps_frame_counter": 0,
 		"fps_last_t": time.monotonic(),
+		"integration_profile_index": -1,
+		"integration_slot": None,
+		"integration_raw": None,
 	}
 	cv2.setMouseCallback(WINDOW_NAME, on_mouse, state)
 
@@ -449,7 +664,7 @@ def main():
 			try:
 				now = time.monotonic()
 				if now >= next_status_poll:
-					send_command(ser, CMD_STATUS)
+					send_usb_command(ser, USB_CMD_GET_STATUS)
 					status_line = read_status_line(ser, timeout_s=0.25)
 					if status_line is not None and status_line.startswith("ST "):
 						fields = parse_status_fields(status_line)
@@ -515,6 +730,8 @@ def main():
 					log_event("PAUSE" if state["paused"] else "RESUME")
 				if key == ord("s"):
 					save_snapshot(state)
+				if key == ord("i"):
+					cycle_integration_profile(ser, state)
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")

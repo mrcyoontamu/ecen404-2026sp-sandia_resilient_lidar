@@ -171,8 +171,8 @@ SECTIONS
   
   .RamData_NonCacheable (NOLOAD) :
   {
-    /* Keep this region aligned to the MPU region size (4KB). */
-    . = ALIGN(4096);
+    /* Keep this region aligned to the MPU region size (8KB). */
+    . = ALIGN(8192);
     __nc_bss_start__ = .;
     /* Lasso CDC buffers (CubeMX may rewrite usbd_cdc_if.c) */
     *usbd_cdc_if.o(.bss)
@@ -184,9 +184,9 @@ SECTIONS
     __nc_bss_end__ = .;
   } >RAM_CD
 
-  /* Ensure the lasso'd non-cacheable region stays within the 4KB MPU window.
+    /* Ensure the lasso'd non-cacheable region stays within the 8KB MPU window.
      If you intentionally grow it, increase the MPU region size accordingly. */
-  ASSERT((__nc_bss_end__ - __nc_bss_start__) <= 0x1000, "RAM_CD non-cacheable region exceeds 4KB (MPU region 0)")
+    ASSERT((__nc_bss_end__ - __nc_bss_start__) <= 0x2000, "RAM_CD non-cacheable region exceeds 8KB (MPU region 0)")
 
   /* Remove information from the standard libraries */
   /DISCARD/ :

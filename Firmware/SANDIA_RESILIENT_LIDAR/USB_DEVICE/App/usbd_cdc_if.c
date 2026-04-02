@@ -23,6 +23,8 @@
 
 /* USER CODE BEGIN INCLUDE */
 
+#include <string.h>
+
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,6 +33,34 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
+
+typedef enum
+{
+  USB_CMD_PARSE_WAIT_MAGIC_0 = 0,
+  USB_CMD_PARSE_WAIT_MAGIC_1,
+  USB_CMD_PARSE_VERSION,
+  USB_CMD_PARSE_COMMAND,
+  USB_CMD_PARSE_SEQUENCE,
+  USB_CMD_PARSE_LENGTH,
+  USB_CMD_PARSE_PAYLOAD,
+  USB_CMD_PARSE_CRC_LO,
+  USB_CMD_PARSE_CRC_HI
+} usb_cmd_parse_state_t;
+
+#define USB_CMD_QUEUE_LEN 8U
+
+static volatile uint8_t s_usb_cmd_queue_head = 0U;
+static volatile uint8_t s_usb_cmd_queue_tail = 0U;
+static usb_cmd_packet_t s_usb_cmd_queue[USB_CMD_QUEUE_LEN];
+
+static usb_cmd_parse_state_t s_usb_cmd_parse_state = USB_CMD_PARSE_WAIT_MAGIC_0;
+static uint8_t s_usb_cmd_parse_version = 0U;
+static uint8_t s_usb_cmd_parse_command = 0U;
+static uint8_t s_usb_cmd_parse_sequence = 0U;
+static uint8_t s_usb_cmd_parse_length = 0U;
+static uint8_t s_usb_cmd_parse_payload[USB_CMD_MAX_PAYLOAD];
+static uint8_t s_usb_cmd_parse_payload_index = 0U;
+static uint16_t s_usb_cmd_parse_crc_rx = 0U;
 
 /* USER CODE END PV */
 
@@ -133,6 +163,15 @@ static int8_t CDC_TransmitCplt_HS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
 
+static void usb_cmd_parse_reset(void);
+static void usb_cmd_queue_reset(void);
+static uint16_t usb_cmd_crc16_ccitt(const uint8_t* data, uint32_t length);
+static void usb_cmd_queue_push(uint8_t command_id,
+                               uint8_t sequence,
+                               const uint8_t* payload,
+                               uint8_t payload_len);
+static void usb_cmd_parse_feed_byte(uint8_t byte);
+
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -160,6 +199,8 @@ static int8_t CDC_Init_HS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceHS, UserTxBufferHS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, UserRxBufferHS);
+  usb_cmd_parse_reset();
+  usb_cmd_queue_reset();
   return (USBD_OK);
   /* USER CODE END 8 */
 }
@@ -271,6 +312,7 @@ static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
   {
     for (uint32_t i = 0; i < *Len; i++)
     {
+      // Keep legacy one-byte command support for compatibility.
       if ((Buf[i] == (uint8_t)'G') || (Buf[i] == (uint8_t)'g'))
       {
         g_usb_capture_request_pending = 1U;
@@ -279,6 +321,8 @@ static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
       {
         g_usb_status_request_pending = 1U;
       }
+
+      usb_cmd_parse_feed_byte(Buf[i]);
     }
   }
 
@@ -333,6 +377,222 @@ static int8_t CDC_TransmitCplt_HS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+static void usb_cmd_parse_reset(void)
+{
+  s_usb_cmd_parse_state = USB_CMD_PARSE_WAIT_MAGIC_0;
+  s_usb_cmd_parse_version = 0U;
+  s_usb_cmd_parse_command = 0U;
+  s_usb_cmd_parse_sequence = 0U;
+  s_usb_cmd_parse_length = 0U;
+  s_usb_cmd_parse_payload_index = 0U;
+  s_usb_cmd_parse_crc_rx = 0U;
+}
+
+static void usb_cmd_queue_reset(void)
+{
+  s_usb_cmd_queue_head = 0U;
+  s_usb_cmd_queue_tail = 0U;
+}
+
+static uint16_t usb_cmd_crc16_ccitt(const uint8_t* data, uint32_t length)
+{
+  uint16_t crc = 0xFFFFU;
+
+  for (uint32_t i = 0U; i < length; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 0x8000U) != 0U)
+      {
+        crc = (uint16_t)((crc << 1) ^ 0x1021U);
+      }
+      else
+      {
+        crc <<= 1;
+      }
+    }
+  }
+
+  return crc;
+}
+
+static void usb_cmd_queue_push(uint8_t command_id,
+                               uint8_t sequence,
+                               const uint8_t* payload,
+                               uint8_t payload_len)
+{
+  uint8_t next_head = (uint8_t)((s_usb_cmd_queue_head + 1U) % USB_CMD_QUEUE_LEN);
+
+  if (next_head == s_usb_cmd_queue_tail)
+  {
+    return;
+  }
+
+  s_usb_cmd_queue[s_usb_cmd_queue_head].command_id = command_id;
+  s_usb_cmd_queue[s_usb_cmd_queue_head].sequence = sequence;
+  s_usb_cmd_queue[s_usb_cmd_queue_head].payload_len = payload_len;
+
+  if ((payload != NULL) && (payload_len > 0U))
+  {
+    (void)memcpy(s_usb_cmd_queue[s_usb_cmd_queue_head].payload, payload, payload_len);
+  }
+
+  s_usb_cmd_queue_head = next_head;
+}
+
+static void usb_cmd_parse_feed_byte(uint8_t byte)
+{
+  switch (s_usb_cmd_parse_state)
+  {
+    case USB_CMD_PARSE_WAIT_MAGIC_0:
+      if (byte == USB_CMD_MAGIC_0)
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_WAIT_MAGIC_1;
+      }
+      break;
+
+    case USB_CMD_PARSE_WAIT_MAGIC_1:
+      if (byte == USB_CMD_MAGIC_1)
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_VERSION;
+      }
+      else if (byte != USB_CMD_MAGIC_0)
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_WAIT_MAGIC_0;
+      }
+      break;
+
+    case USB_CMD_PARSE_VERSION:
+      s_usb_cmd_parse_version = byte;
+      s_usb_cmd_parse_state = USB_CMD_PARSE_COMMAND;
+      break;
+
+    case USB_CMD_PARSE_COMMAND:
+      s_usb_cmd_parse_command = byte;
+      s_usb_cmd_parse_state = USB_CMD_PARSE_SEQUENCE;
+      break;
+
+    case USB_CMD_PARSE_SEQUENCE:
+      s_usb_cmd_parse_sequence = byte;
+      s_usb_cmd_parse_state = USB_CMD_PARSE_LENGTH;
+      break;
+
+    case USB_CMD_PARSE_LENGTH:
+      s_usb_cmd_parse_length = byte;
+      s_usb_cmd_parse_payload_index = 0U;
+
+      if (s_usb_cmd_parse_length > USB_CMD_MAX_PAYLOAD)
+      {
+        usb_cmd_parse_reset();
+      }
+      else if (s_usb_cmd_parse_length == 0U)
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_CRC_LO;
+      }
+      else
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_PAYLOAD;
+      }
+      break;
+
+    case USB_CMD_PARSE_PAYLOAD:
+      s_usb_cmd_parse_payload[s_usb_cmd_parse_payload_index++] = byte;
+      if (s_usb_cmd_parse_payload_index >= s_usb_cmd_parse_length)
+      {
+        s_usb_cmd_parse_state = USB_CMD_PARSE_CRC_LO;
+      }
+      break;
+
+    case USB_CMD_PARSE_CRC_LO:
+      s_usb_cmd_parse_crc_rx = byte;
+      s_usb_cmd_parse_state = USB_CMD_PARSE_CRC_HI;
+      break;
+
+    case USB_CMD_PARSE_CRC_HI:
+    {
+      uint8_t header_and_payload[6U + USB_CMD_MAX_PAYLOAD];
+      uint16_t crc_calculated;
+      uint16_t crc_received;
+
+      s_usb_cmd_parse_crc_rx |= (uint16_t)((uint16_t)byte << 8);
+
+      header_and_payload[0] = USB_CMD_MAGIC_0;
+      header_and_payload[1] = USB_CMD_MAGIC_1;
+      header_and_payload[2] = s_usb_cmd_parse_version;
+      header_and_payload[3] = s_usb_cmd_parse_command;
+      header_and_payload[4] = s_usb_cmd_parse_sequence;
+      header_and_payload[5] = s_usb_cmd_parse_length;
+
+      if (s_usb_cmd_parse_length > 0U)
+      {
+        (void)memcpy(&header_and_payload[6], s_usb_cmd_parse_payload, s_usb_cmd_parse_length);
+      }
+
+      crc_calculated = usb_cmd_crc16_ccitt(header_and_payload, (uint32_t)(6U + s_usb_cmd_parse_length));
+      crc_received = s_usb_cmd_parse_crc_rx;
+
+      if ((s_usb_cmd_parse_version == USB_CMD_VERSION_1) && (crc_calculated == crc_received))
+      {
+        usb_cmd_queue_push(s_usb_cmd_parse_command,
+                           s_usb_cmd_parse_sequence,
+                           s_usb_cmd_parse_payload,
+                           s_usb_cmd_parse_length);
+      }
+
+      usb_cmd_parse_reset();
+      break;
+    }
+
+    default:
+      usb_cmd_parse_reset();
+      break;
+  }
+}
+
+uint8_t usb_cmd_try_dequeue(usb_cmd_packet_t* out_packet)
+{
+  uint8_t tail;
+  uint8_t head;
+
+  if (out_packet == NULL)
+  {
+    return 0U;
+  }
+
+  tail = s_usb_cmd_queue_tail;
+  head = s_usb_cmd_queue_head;
+
+  if ((tail >= USB_CMD_QUEUE_LEN) || (head >= USB_CMD_QUEUE_LEN))
+  {
+    usb_cmd_queue_reset();
+    return 0U;
+  }
+
+  if (tail == head)
+  {
+    return 0U;
+  }
+
+  out_packet->command_id = s_usb_cmd_queue[tail].command_id;
+  out_packet->sequence = s_usb_cmd_queue[tail].sequence;
+  out_packet->payload_len = s_usb_cmd_queue[tail].payload_len;
+
+  if (out_packet->payload_len > USB_CMD_MAX_PAYLOAD)
+  {
+    usb_cmd_queue_reset();
+    return 0U;
+  }
+
+  for (uint8_t i = 0U; i < out_packet->payload_len; i++)
+  {
+    out_packet->payload[i] = s_usb_cmd_queue[tail].payload[i];
+  }
+
+  s_usb_cmd_queue_tail = (uint8_t)((tail + 1U) % USB_CMD_QUEUE_LEN);
+  return 1U;
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 

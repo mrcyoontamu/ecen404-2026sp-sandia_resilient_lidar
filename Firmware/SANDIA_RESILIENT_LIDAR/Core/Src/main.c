@@ -190,16 +190,23 @@ static void usb_start_nonfatal(void);
 static void dcmi_stop_abort_and_clear(void);
 static void reset_capture_runtime_flags(void);
 static uint8_t start_capture_once(void);
+static void process_usb_command_queue(void);
+static uint8_t send_usb_command_response(uint8_t sequence,
+                                         uint8_t command,
+                                         uint8_t status,
+                                         const uint8_t* payload,
+                                         uint8_t payload_len);
+static uint16_t usb_cmd_crc16_ccitt(const uint8_t* data, uint32_t length);
 static void send_debug_status_line(void);
 static void run_capture_state_machine(void);
 void calculate_depth_simple(void);
 void calculate_amplitude_simple(void);
 void calculate_grayscale_simple(void);
 
-__attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS();
-__attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale();
-__attribute__((used, optimize("O0"))) epc_status_t testing_preset();
-__attribute__((used, optimize("O0"))) epc_status_t testing_preset2();
+epc_status_t default_preset_4DCS();
+epc_status_t default_preset_grayscale();
+epc_status_t testing_preset();
+epc_status_t testing_preset2();
 
 /* USER CODE END PFP */
 
@@ -261,10 +268,6 @@ int main(void)
   uint32_t loop_tick = 0;
   uint32_t frame_timeout_ms = 5000;
 
-  // Disable USB interrupt during power-up to prevent spurious triggers
-  // from EMI/voltage transients on the 10V/neg10V rails coupling into USB lines
-  //HAL_NVIC_DisableIRQ(OTG_HS_IRQn);
-
   epc_status_t init_status = epc660_power_up();
   if (init_status == EPC_OK)
   {
@@ -277,12 +280,6 @@ int main(void)
   }
 
   usb_start_nonfatal();
-
-
-  // Clear any pending USB interrupt flags that accumulated, then re-enable
-  //__HAL_PCD_CLEAR_FLAG(&hpcd_USB_OTG_HS, 0xFFFFFFFF);
-  //NVIC_ClearPendingIRQ(OTG_HS_IRQn);
-  //HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
 
   all_frames_ready = 0;
 
@@ -314,6 +311,8 @@ int main(void)
     {
       handle_epc660_power_toggle_request();
     }
+
+    process_usb_command_queue();
 
     if (g_usb_status_request_pending != 0U)
     {
@@ -926,6 +925,167 @@ static uint8_t start_capture_once(void)
   return 1;
 }
 
+static void process_usb_command_queue(void)
+{
+  usb_cmd_packet_t packet;
+
+  while (usb_cmd_try_dequeue(&packet) != 0U)
+  {
+    switch (packet.command_id)
+    {
+      case USB_CMD_GET_FRAME:
+        g_usb_capture_request_pending = 1U;
+        break;
+
+      case USB_CMD_GET_STATUS:
+        g_usb_status_request_pending = 1U;
+        break;
+
+      case USB_CMD_SET_MOD_DIVIDER:
+      {
+        epc_status_t status;
+
+        if (packet.payload_len != 1U)
+        {
+          (void)send_usb_command_response(packet.sequence,
+                                          packet.command_id,
+                                          USB_CMD_STATUS_BAD_LENGTH,
+                                          NULL,
+                                          0U);
+          break;
+        }
+
+        if (epc660_power_state != EPC660_POWER_ON)
+        {
+          (void)send_usb_command_response(packet.sequence,
+                                          packet.command_id,
+                                          USB_CMD_STATUS_REJECTED,
+                                          NULL,
+                                          0U);
+          break;
+        }
+
+        status = epc_set_modulation_divider(packet.payload[0]);
+        (void)send_usb_command_response(packet.sequence,
+                                        packet.command_id,
+                                        (status == EPC_OK) ? USB_CMD_STATUS_OK : USB_CMD_STATUS_DEVICE_ERROR,
+                                        NULL,
+                                        0U);
+        break;
+      }
+
+      case USB_CMD_SET_INTEGRATION_RAW:
+      {
+        uint8_t integration_slot;
+        uint16_t integration_raw;
+        epc_status_t status;
+
+        if (packet.payload_len != 3U)
+        {
+          (void)send_usb_command_response(packet.sequence,
+                                          packet.command_id,
+                                          USB_CMD_STATUS_BAD_LENGTH,
+                                          NULL,
+                                          0U);
+          break;
+        }
+
+        if (epc660_power_state != EPC660_POWER_ON)
+        {
+          (void)send_usb_command_response(packet.sequence,
+                                          packet.command_id,
+                                          USB_CMD_STATUS_REJECTED,
+                                          NULL,
+                                          0U);
+          break;
+        }
+
+        integration_slot = packet.payload[0];
+        integration_raw = (uint16_t)packet.payload[1] | ((uint16_t)packet.payload[2] << 8);
+
+        status = epc_set_integration_time_raw(integration_slot, integration_raw);
+        (void)send_usb_command_response(packet.sequence,
+                                        packet.command_id,
+                                        (status == EPC_OK) ? USB_CMD_STATUS_OK : USB_CMD_STATUS_DEVICE_ERROR,
+                                        NULL,
+                                        0U);
+        break;
+      }
+
+      default:
+        (void)send_usb_command_response(packet.sequence,
+                                        packet.command_id,
+                                        USB_CMD_STATUS_UNSUPPORTED,
+                                        NULL,
+                                        0U);
+        break;
+    }
+  }
+}
+
+static uint8_t send_usb_command_response(uint8_t sequence,
+                                         uint8_t command,
+                                         uint8_t status,
+                                         const uint8_t* payload,
+                                         uint8_t payload_len)
+{
+  uint8_t frame[6U + USB_CMD_MAX_PAYLOAD + 2U];
+  uint8_t response_payload_len;
+  uint16_t crc;
+  uint8_t frame_len;
+
+  if (payload_len > (USB_CMD_MAX_PAYLOAD - 2U))
+  {
+    return 0U;
+  }
+
+  response_payload_len = (uint8_t)(payload_len + 2U);
+
+  frame[0] = USB_CMD_MAGIC_0;
+  frame[1] = USB_CMD_MAGIC_1;
+  frame[2] = USB_CMD_VERSION_1;
+  frame[3] = USB_CMD_RESPONSE;
+  frame[4] = sequence;
+  frame[5] = response_payload_len;
+  frame[6] = command;
+  frame[7] = status;
+
+  if ((payload != NULL) && (payload_len > 0U))
+  {
+    (void)memcpy(&frame[8], payload, payload_len);
+  }
+
+  crc = usb_cmd_crc16_ccitt(frame, (uint32_t)(6U + response_payload_len));
+  frame[6U + response_payload_len] = (uint8_t)(crc & 0xFFU);
+  frame[7U + response_payload_len] = (uint8_t)((crc >> 8) & 0xFFU);
+
+  frame_len = (uint8_t)(8U + response_payload_len);
+  return usb_stream_transmit_blocking(frame, frame_len);
+}
+
+static uint16_t usb_cmd_crc16_ccitt(const uint8_t* data, uint32_t length)
+{
+  uint16_t crc = 0xFFFFU;
+
+  for (uint32_t i = 0U; i < length; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 0x8000U) != 0U)
+      {
+        crc = (uint16_t)((crc << 1) ^ 0x1021U);
+      }
+      else
+      {
+        crc <<= 1;
+      }
+    }
+  }
+
+  return crc;
+}
+
 static void send_debug_status_line(void)
 {
   char line[224];
@@ -1199,7 +1359,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 }
 
 /* EPC660 CONFIG PRESETS */
-__attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS()
+epc_status_t default_preset_4DCS()
 {
 	__NOP();
 	volatile epc_status_t status;
@@ -1212,7 +1372,7 @@ __attribute__((used, optimize("O0"))) epc_status_t default_preset_4DCS()
 
 	return EPC_OK;
 }
-__attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale()
+epc_status_t default_preset_grayscale()
 {
 	__NOP();
 	volatile epc_status_t status;
@@ -1225,7 +1385,7 @@ __attribute__((used, optimize("O0"))) epc_status_t default_preset_grayscale()
 
 	return EPC_OK;
 }
-__attribute__((used, optimize("O0"))) epc_status_t testing_preset()
+epc_status_t testing_preset()
 {
 	epc_status_t status;
 	if ((status = epc_set_measurement_mode(EPC_MODE_4DCS_TOF)) != EPC_OK) return status;
@@ -1237,7 +1397,7 @@ __attribute__((used, optimize("O0"))) epc_status_t testing_preset()
 
 	return EPC_OK;
 }
-__attribute__((used, optimize("O0"))) epc_status_t testing_preset2()
+epc_status_t testing_preset2()
 {
 	epc_status_t status;
 	if ((status = epc_set_measurement_mode(EPC_MODE_4DCS_TOF)) != EPC_OK) return status;
@@ -1296,7 +1456,7 @@ void MPU_Config(void)
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
   MPU_InitStruct.BaseAddress = 0x30000000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_4KB;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_8KB;
   MPU_InitStruct.SubRegionDisable = 0x0;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
