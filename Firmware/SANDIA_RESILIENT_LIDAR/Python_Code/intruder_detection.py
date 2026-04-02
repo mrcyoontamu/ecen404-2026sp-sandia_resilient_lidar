@@ -55,9 +55,10 @@ DISPLAY_SCALE = 3
 
 # Intruder algorithm tuning.
 DIFF_THRESHOLD_M = 0.1
-MIN_FOREGROUND_PIXELS = 220
+MIN_BLOB_AREA_PIXELS = 80
+BLOB_TRIGGER_PIXELS = 220
 TEMPORAL_TRIGGER_FRAMES = 2
-MASK_BLUR_KERNEL = 31
+MASK_BLUR_KERNEL = 11
 
 CMD_GET_FRAME = b"G"
 CMD_STATUS = b"S"
@@ -318,9 +319,23 @@ def update_intruder_detection(state, depth_m, invalid_mask):
 			blur_kernel += 1
 		if blur_kernel > 1:
 			fg_mask = cv2.medianBlur(fg_mask, blur_kernel)
+
+		# Keep only contiguous blobs above the minimum area so scattered noise
+		# in distant regions cannot add up to a trigger.
+		num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
+		filtered_mask = np.zeros_like(fg_mask)
+		largest_blob_pixels = 0
+		for label_idx in range(1, num_labels):
+			blob_area = int(stats[label_idx, cv2.CC_STAT_AREA])
+			if blob_area >= MIN_BLOB_AREA_PIXELS:
+				filtered_mask[labels == label_idx] = 255
+				if blob_area > largest_blob_pixels:
+					largest_blob_pixels = blob_area
+
+		fg_mask = filtered_mask
 		foreground_pixels = int(np.count_nonzero(fg_mask))
 
-		if foreground_pixels >= MIN_FOREGROUND_PIXELS:
+		if largest_blob_pixels >= BLOB_TRIGGER_PIXELS:
 			state["trigger_counter"] += 1
 		else:
 			state["trigger_counter"] = 0
@@ -331,10 +346,12 @@ def update_intruder_detection(state, depth_m, invalid_mask):
 			log_event("INTRUDER DETECTED")
 	else:
 		foreground_pixels = 0
+		largest_blob_pixels = 0
 		state["trigger_counter"] = 0
 
 	state["fg_mask"] = fg_mask
 	state["foreground_pixels"] = foreground_pixels
+	state["largest_blob_pixels"] = largest_blob_pixels
 
 
 def rearm_detection(state):
@@ -344,6 +361,7 @@ def rearm_detection(state):
 	state["ref_depth_m"] = None
 	state["fg_mask"] = None
 	state["foreground_pixels"] = 0
+	state["largest_blob_pixels"] = 0
 	log_event("System rearmed. Press 'b' to capture a new background.")
 
 
@@ -391,8 +409,18 @@ def draw_overlay(display_bgr, state):
 
 	cv2.putText(
 		view,
-		f"fg_pixels={state['foreground_pixels']} threshold={MIN_FOREGROUND_PIXELS}",
+		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']}",
 		(10, 75),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.50,
+		(255, 255, 255),
+		1,
+	)
+
+	cv2.putText(
+		view,
+		f"blob_trigger={BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
+		(10, 95),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.50,
 		(255, 255, 255),
@@ -403,7 +431,7 @@ def draw_overlay(display_bgr, state):
 		cv2.putText(
 			view,
 			f"triggered_at={state['trigger_timestamp']}",
-			(10, 95),
+			(10, 115),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.50,
 			(255, 255, 255),
@@ -470,6 +498,7 @@ def main():
 		"ref_depth_m": None,
 		"fg_mask": None,
 		"foreground_pixels": 0,
+		"largest_blob_pixels": 0,
 		"trigger_counter": 0,
 		"triggered": False,
 		"trigger_timestamp": None,
