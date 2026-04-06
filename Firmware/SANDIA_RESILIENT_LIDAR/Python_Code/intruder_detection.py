@@ -30,14 +30,14 @@ MODULATION_HZ = DEFAULT_MODULATION_HZ
 SPEED_OF_LIGHT_M_PER_S = 299792458.0
 
 # Datasheet 9.2.2 guidance: amplitudes below this LSB threshold are not useful for distance.
-AMPLITUDE_MIN_LSB = 35.0
+AMPLITUDE_MIN_LSB = 25.0
 
 # Distance offset (DOFFSET in datasheet equation [2]). Keep 0 until calibrated.
-DISTANCE_OFFSET_M = -1.8288
+DISTANCE_OFFSET_M = -2.25
 
 # For calibration, keep negative-offset results clamped at 0 m rather than wrapped
 # to the unambiguous max range.
-WRAP_WITH_UNAMBIGUOUS_RANGE = False
+WRAP_WITH_UNAMBIGUOUS_RANGE = True
 
 # Unambiguous range for iToF phase at modulation frequency f is c/(2f).
 MAX_DEPTH_M = SPEED_OF_LIGHT_M_PER_S / (2.0 * MODULATION_HZ)
@@ -56,13 +56,28 @@ SHOW_FILTER_WORKFLOW = True
 
 # Intruder algorithm tuning.
 DIFF_THRESHOLD_M = 0.1
-MIN_BLOB_AREA_PIXELS = 80
-BLOB_TRIGGER_PIXELS = 120
+MIN_BLOB_AREA_PIXELS = 25
+BLOB_TRIGGER_PIXELS = 30
 TEMPORAL_TRIGGER_FRAMES = 1
 MASK_BLUR_KERNEL = 11
 ENABLE_MASK_BLUR = True
 ENABLE_DEPTH_PRE_FILTER = True
 DEPTH_FILTER_KERNEL = 11
+
+# Adaptive change thresholding based on signal confidence.
+ENABLE_ADAPTIVE_DIFF_THRESHOLD = True
+ADAPTIVE_AMP_LOW_LSB = 30.0
+ADAPTIVE_AMP_HIGH_LSB = 120.0
+LOW_CONF_THRESHOLD_SCALE = 2
+MIN_DETECTION_CONFIDENCE = 0.05
+ENABLE_VALIDITY_TRANSITION_TRIGGER = False
+VALIDITY_TRANSITION_MIN_CONFIDENCE = 0.65
+ENABLE_SATURATION_TRANSITION_TRIGGER = True
+
+# When depth gets clipped to 0.0 m by offset/clamping, optionally treat
+# those pixels as invalid so they do not create false edge alarms.
+INVALIDATE_ZERO_CLAMP_PIXELS = True
+ZERO_DEPTH_INVALID_EPS_M = 0.01
 
 # Kalman smoothing for largest contiguous blob area (pixels).
 ENABLE_KALMAN = True
@@ -70,6 +85,24 @@ KALMAN_USE_FOR_TRIGGER = True
 KALMAN_MAX_MISSED_FRAMES = 8
 KALMAN_PROCESS_NOISE = 8
 KALMAN_MEASUREMENT_NOISE = 300
+
+USB_CMD_MAGIC_0 = 0xA5
+USB_CMD_MAGIC_1 = 0x5A
+USB_CMD_VERSION_1 = 0x01
+USB_CMD_MAX_PAYLOAD = 24
+
+USB_CMD_SET_INTEGRATION_RAW = 0x11
+USB_CMD_RESPONSE = 0x7F
+USB_CMD_STATUS_OK = 0x00
+
+INTEGRATION_PROFILES = [
+	(2, 38399),
+	(4, 38399),
+	(6, 38399),
+	(12, 38399),
+]
+
+_usb_command_sequence = 0
 
 CMD_GET_FRAME = b"G"
 CMD_STATUS = b"S"
@@ -218,6 +251,172 @@ def flush_serial_input(ser):
 		log_event(f"RX flush failed: {exc}")
 
 
+def crc16_ccitt(data):
+	crc = 0xFFFF
+	for byte in data:
+		crc ^= (byte << 8)
+		for _ in range(8):
+			if crc & 0x8000:
+				crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+			else:
+				crc = (crc << 1) & 0xFFFF
+	return crc
+
+
+def next_usb_command_sequence():
+	global _usb_command_sequence
+	_usb_command_sequence = (_usb_command_sequence + 1) & 0xFF
+	return _usb_command_sequence
+
+
+def build_usb_command_packet(command_id, payload=b"", sequence=None):
+	if sequence is None:
+		sequence = next_usb_command_sequence()
+
+	if len(payload) > USB_CMD_MAX_PAYLOAD:
+		raise ValueError(f"Payload too large ({len(payload)} > {USB_CMD_MAX_PAYLOAD})")
+
+	body = bytes([
+		USB_CMD_MAGIC_0,
+		USB_CMD_MAGIC_1,
+		USB_CMD_VERSION_1,
+		command_id & 0xFF,
+		sequence & 0xFF,
+		len(payload) & 0xFF,
+	]) + payload
+
+	crc = crc16_ccitt(body)
+	packet = body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+	return sequence, packet
+
+
+def read_usb_command_response(ser, timeout_s=0.30):
+	deadline = time.monotonic() + timeout_s
+	window = bytearray()
+
+	while time.monotonic() < deadline:
+		ch = ser.read(1)
+		if not ch:
+			continue
+
+		window.extend(ch)
+		if len(window) > 2:
+			window = window[-2:]
+
+		if window == bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1]):
+			header = ser.read(4)
+			if len(header) != 4:
+				continue
+
+			version, command_id, sequence, payload_len = header
+			payload_plus_crc = ser.read(payload_len + 2)
+			if len(payload_plus_crc) != (payload_len + 2):
+				continue
+
+			payload = payload_plus_crc[:payload_len]
+			crc_rx = payload_plus_crc[payload_len] | (payload_plus_crc[payload_len + 1] << 8)
+			frame_wo_crc = bytes([USB_CMD_MAGIC_0, USB_CMD_MAGIC_1, version, command_id, sequence, payload_len]) + payload
+			crc_calc = crc16_ccitt(frame_wo_crc)
+
+			if crc_calc != crc_rx:
+				continue
+
+			if (version != USB_CMD_VERSION_1) or (command_id != USB_CMD_RESPONSE):
+				continue
+
+			if payload_len < 2:
+				continue
+
+			return {
+				"sequence": sequence,
+				"origin_cmd": payload[0],
+				"status": payload[1],
+				"payload": payload[2:],
+			}
+
+	return None
+
+
+def send_usb_command(ser, command_id, payload=b"", expect_response=False, timeout_s=0.30):
+	sequence, packet = build_usb_command_packet(command_id, payload)
+	ser.write(packet)
+	ser.flush()
+
+	if not expect_response:
+		return {"ok": True, "sequence": sequence}
+
+	deadline = time.monotonic() + timeout_s
+	while time.monotonic() < deadline:
+		remaining = max(0.01, deadline - time.monotonic())
+		response = read_usb_command_response(ser, timeout_s=remaining)
+		if response is None:
+			continue
+
+		if response["sequence"] != sequence:
+			continue
+
+		if response["origin_cmd"] != (command_id & 0xFF):
+			continue
+
+		response["ok"] = response["status"] == USB_CMD_STATUS_OK
+		return response
+
+	return {
+		"ok": False,
+		"sequence": sequence,
+		"origin_cmd": command_id & 0xFF,
+		"status": None,
+		"payload": b"",
+	}
+
+
+def set_integration_time_raw(ser, integration_slot, integration_raw):
+	integration_slot = int(integration_slot)
+	integration_raw = int(integration_raw)
+
+	if integration_slot < 0 or integration_slot > 255:
+		raise ValueError("integration_slot must be in [0, 255]")
+	if integration_raw < 0 or integration_raw > 65535:
+		raise ValueError("integration_raw must be in [0, 65535]")
+
+	payload = bytes([
+		integration_slot & 0xFF,
+		integration_raw & 0xFF,
+		(integration_raw >> 8) & 0xFF,
+	])
+
+	return send_usb_command(
+		ser,
+		USB_CMD_SET_INTEGRATION_RAW,
+		payload=payload,
+		expect_response=True,
+		timeout_s=0.4,
+	)
+
+
+def cycle_integration_profile(ser, state):
+	next_index = (state["integration_profile_index"] + 1) % len(INTEGRATION_PROFILES)
+	slot, raw = INTEGRATION_PROFILES[next_index]
+
+	# Drop any stale bytes before waiting for a command response frame.
+	flush_serial_input(ser)
+	result = set_integration_time_raw(ser, slot, raw)
+
+	if result.get("ok", False):
+		state["integration_profile_index"] = next_index
+		state["integration_slot"] = slot
+		state["integration_raw"] = raw
+		log_event(f"Integration set: slot={slot} raw={raw}")
+	else:
+		log_event(
+			f"Integration set failed: slot={slot} raw={raw} status={result.get('status')}"
+		)
+
+	# Keep stream parser in a clean state after config response traffic.
+	flush_serial_input(ser)
+	return result
+
+
 def send_command(ser, cmd):
 	ser.write(cmd)
 	ser.flush()
@@ -323,17 +522,25 @@ def compute_phase_and_depth(dcs_frames, depth_scale_m_per_rad, max_depth_m):
 	phase_rad = np.arctan2(q, in_phase)
 	phase_rad = np.where(phase_rad < 0.0, phase_rad + 2.0 * np.pi, phase_rad)
 
-	depth_m = phase_rad * depth_scale_m_per_rad + DISTANCE_OFFSET_M
+	depth_unclipped_m = phase_rad * depth_scale_m_per_rad + DISTANCE_OFFSET_M
+	depth_m = depth_unclipped_m.copy()
 	if WRAP_WITH_UNAMBIGUOUS_RANGE:
 		depth_m = np.where(depth_m > max_depth_m, depth_m - max_depth_m, depth_m)
 		depth_m = np.where(depth_m < 0.0, depth_m + max_depth_m, depth_m)
 	else:
 		depth_m = np.clip(depth_m, 0.0, max_depth_m)
 
-	invalid_mask = sat_mask | low_signal_mask
-	depth_m[invalid_mask] = np.nan
+	zero_clamped_mask = np.zeros(depth_m.shape, dtype=bool)
+	if (not WRAP_WITH_UNAMBIGUOUS_RANGE) and INVALIDATE_ZERO_CLAMP_PIXELS:
+		# Identify pixels that became 0.0 due to negative depth before clipping.
+		zero_clamped_mask = depth_unclipped_m <= ZERO_DEPTH_INVALID_EPS_M
+		depth_m[zero_clamped_mask] = np.nan
 
-	return phase_rad, depth_m, invalid_mask
+	# Keep saturated pixels invalid; low-signal pixels are handled with
+	# confidence-weighted thresholds instead of hard reject.
+	depth_m[sat_mask] = np.nan
+
+	return phase_rad, depth_m, sat_mask, low_signal_mask, amplitude_lsb, zero_clamped_mask
 
 
 def depth_to_colormap(depth_m, invalid_mask, max_depth_m):
@@ -345,7 +552,7 @@ def depth_to_colormap(depth_m, invalid_mask, max_depth_m):
 	return bgr
 
 
-def filter_depth_for_detection(depth_m):
+def filter_depth_for_detection(depth_m, max_depth_m):
 	filtered = depth_m.copy()
 	if not ENABLE_DEPTH_PRE_FILTER:
 		return filtered
@@ -357,10 +564,32 @@ def filter_depth_for_detection(depth_m):
 		kernel_size += 1
 
 	valid_mask = np.isfinite(filtered)
-	depth_f32 = np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 	weights = valid_mask.astype(np.float32)
 	kernel = np.ones((kernel_size, kernel_size), dtype=np.float32)
 
+	if WRAP_WITH_UNAMBIGUOUS_RANGE and max_depth_m > 0.0:
+		# Circular averaging avoids seam artifacts near 0/Dmax wrap boundary.
+		depth_safe = np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+		depth_wrapped = np.mod(depth_safe, max_depth_m)
+		angle = (depth_wrapped / max_depth_m) * (2.0 * np.pi)
+
+		cos_img = np.cos(angle).astype(np.float32) * weights
+		sin_img = np.sin(angle).astype(np.float32) * weights
+
+		cos_sum = cv2.filter2D(cos_img, -1, kernel, borderType=cv2.BORDER_REFLECT)
+		sin_sum = cv2.filter2D(sin_img, -1, kernel, borderType=cv2.BORDER_REFLECT)
+		weight_sum = cv2.filter2D(weights, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+		blurred = depth_wrapped.copy()
+		has_support = weight_sum > 0.0
+
+		angle_mean = np.arctan2(sin_sum, cos_sum)
+		angle_mean = np.where(angle_mean < 0.0, angle_mean + 2.0 * np.pi, angle_mean)
+		blurred[has_support] = (angle_mean[has_support] / (2.0 * np.pi)) * max_depth_m
+		blurred[~valid_mask] = np.nan
+		return blurred
+
+	depth_f32 = np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 	depth_sum = cv2.filter2D(depth_f32, -1, kernel, borderType=cv2.BORDER_REFLECT)
 	weight_sum = cv2.filter2D(weights, -1, kernel, borderType=cv2.BORDER_REFLECT)
 
@@ -371,28 +600,71 @@ def filter_depth_for_detection(depth_m):
 	return blurred
 
 
-def update_intruder_detection(state, depth_m, invalid_mask):
-	depth_for_model = filter_depth_for_detection(depth_m)
-	depth_for_model[invalid_mask] = np.nan
+def compute_amplitude_confidence(amplitude_lsb):
+	denom = max(1e-6, ADAPTIVE_AMP_HIGH_LSB - ADAPTIVE_AMP_LOW_LSB)
+	confidence = (amplitude_lsb.astype(np.float32) - ADAPTIVE_AMP_LOW_LSB) / denom
+	return np.clip(confidence, 0.0, 1.0)
+
+
+def compute_depth_delta_m(depth_a_m, depth_b_m, max_depth_m):
+	delta = np.abs(depth_a_m - depth_b_m)
+	if WRAP_WITH_UNAMBIGUOUS_RANGE:
+		# Circular distance on [0, max_depth_m) prevents wrap-boundary jumps
+		# from appearing as large false changes.
+		delta = np.minimum(delta, np.abs(max_depth_m - delta))
+	return delta
+
+
+def update_intruder_detection(state, depth_m, sat_mask, amplitude_lsb, extra_invalid_mask=None):
+	if extra_invalid_mask is None:
+		extra_invalid_mask = np.zeros(depth_m.shape, dtype=bool)
+
+	depth_for_model = filter_depth_for_detection(depth_m, state["max_depth_m"])
+	depth_for_model[sat_mask | extra_invalid_mask] = np.nan
 	state["depth_filtered_m"] = depth_for_model.copy()
+
+	amp_confidence = compute_amplitude_confidence(amplitude_lsb)
+	state["amp_confidence"] = amp_confidence
 
 	valid_mask = np.isfinite(depth_for_model)
 	fg_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
 	candidate_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
 	post_blur_mask = np.zeros(depth_for_model.shape, dtype=np.uint8)
 	diff_for_display_m = None
+	adaptive_threshold_m = None
 	trigger_metric = 0.0
 
 	if state["ref_depth_m"] is not None:
 		ref = state["ref_depth_m"]
-		diff = np.abs(depth_for_model - ref)
+		diff = compute_depth_delta_m(depth_for_model, ref, state["max_depth_m"])
 		diff_for_display_m = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-		# Treat validity transitions as foreground events.
+		if ENABLE_ADAPTIVE_DIFF_THRESHOLD:
+			adaptive_threshold_m = DIFF_THRESHOLD_M * (1.0 + LOW_CONF_THRESHOLD_SCALE * (1.0 - amp_confidence))
+		else:
+			adaptive_threshold_m = np.full(depth_for_model.shape, DIFF_THRESHOLD_M, dtype=np.float32)
+
+		confidence_mask = amp_confidence >= MIN_DETECTION_CONFIDENCE
+
+		# Baseline foreground from depth delta with confidence gating.
 		bg_valid_mask = np.isfinite(ref)
-		bg_invalid_now_valid = (~bg_valid_mask) & valid_mask
-		now_invalid_bg_valid = bg_valid_mask & (~valid_mask)
-		candidate = (valid_mask & bg_valid_mask & (diff >= DIFF_THRESHOLD_M)) | bg_invalid_now_valid | now_invalid_bg_valid
+		candidate = valid_mask & bg_valid_mask & (diff >= adaptive_threshold_m) & confidence_mask
+
+		# If previously valid background pixels become saturated now,
+		# count this as a foreground change (optional).
+		if ENABLE_SATURATION_TRANSITION_TRIGGER:
+			sat_transition = bg_valid_mask & sat_mask
+			candidate = candidate | sat_transition
+
+		if ENABLE_VALIDITY_TRANSITION_TRIGGER:
+			bg_invalid_now_valid = (~bg_valid_mask) & valid_mask
+			now_invalid_bg_valid = bg_valid_mask & (~valid_mask)
+			validity_change = bg_invalid_now_valid | now_invalid_bg_valid
+			candidate = candidate | (
+				validity_change
+				& (amp_confidence >= VALIDITY_TRANSITION_MIN_CONFIDENCE)
+			)
+
 		candidate_mask[candidate] = 255
 		fg_mask = candidate_mask.copy()
 
@@ -462,11 +734,13 @@ def update_intruder_detection(state, depth_m, invalid_mask):
 		state["blob_area_kf"] = None
 		state["blob_missed_frames"] = 0
 		state["smoothed_blob_pixels"] = 0.0
+		state["amp_confidence"] = None
 
 	state["fg_mask"] = fg_mask
 	state["candidate_mask"] = candidate_mask
 	state["post_blur_mask"] = post_blur_mask
 	state["diff_m"] = diff_for_display_m
+	state["adaptive_threshold_m"] = adaptive_threshold_m
 	state["foreground_pixels"] = foreground_pixels
 	state["largest_blob_pixels"] = largest_blob_pixels
 	state["trigger_metric_pixels"] = trigger_metric if state["ref_depth_m"] is not None else 0.0
@@ -481,6 +755,8 @@ def rearm_detection(state):
 	state["candidate_mask"] = None
 	state["post_blur_mask"] = None
 	state["diff_m"] = None
+	state["adaptive_threshold_m"] = None
+	state["amp_confidence"] = None
 	state["foreground_pixels"] = 0
 	state["largest_blob_pixels"] = 0
 	state["smoothed_blob_pixels"] = 0.0
@@ -498,7 +774,7 @@ def capture_background(state):
 	if state["depth_filtered_m"] is not None:
 		state["ref_depth_m"] = state["depth_filtered_m"].copy()
 	else:
-		state["ref_depth_m"] = filter_depth_for_detection(state["depth_m"])
+		state["ref_depth_m"] = filter_depth_for_detection(state["depth_m"], state["max_depth_m"])
 	state["trigger_counter"] = 0
 	state["triggered"] = False
 	state["trigger_timestamp"] = None
@@ -600,23 +876,21 @@ def draw_overlay(display_bgr, state):
 
 	draw_outlined_text(
 		view,
-		"keys: q quit | space pause | s save | b bg capture | r rearm | w workflow",
+		"keys: q quit | space pause | s save | b bg capture | r rearm | w workflow | i integration",
 		(10, 55),
 		font_scale=0.48,
 		thickness=1,
 	)
 
-	draw_outlined_text(
-		view,
-		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']} smooth_blob={state['smoothed_blob_pixels']:.1f}",
-		(10, 75),
-		font_scale=0.50,
-		thickness=1,
-	)
+	if state["integration_slot"] is None:
+		int_text = "integration: not set (press i)"
+	else:
+		int_text = f"integration: slot {state['integration_slot']} raw {state['integration_raw']}"
+	draw_outlined_text(view, int_text, (10, 75), font_scale=0.50, thickness=1)
 
 	draw_outlined_text(
 		view,
-		f"trigger={state['trigger_metric_pixels']:.1f}/{BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
+		f"fg_pixels={state['foreground_pixels']} largest_blob={state['largest_blob_pixels']} smooth_blob={state['smoothed_blob_pixels']:.1f}",
 		(10, 95),
 		font_scale=0.50,
 		thickness=1,
@@ -624,8 +898,24 @@ def draw_overlay(display_bgr, state):
 
 	draw_outlined_text(
 		view,
-		f"depth_filter={'on' if ENABLE_DEPTH_PRE_FILTER else 'off'}({DEPTH_FILTER_KERNEL}) mask_blur={'on' if ENABLE_MASK_BLUR else 'off'}({MASK_BLUR_KERNEL}) kalman={'on' if ENABLE_KALMAN else 'off'}",
+		f"trigger={state['trigger_metric_pixels']:.1f}/{BLOB_TRIGGER_PIXELS} min_blob_area={MIN_BLOB_AREA_PIXELS}",
 		(10, 115),
+		font_scale=0.50,
+		thickness=1,
+	)
+
+	draw_outlined_text(
+		view,
+		f"depth_filter={'on' if ENABLE_DEPTH_PRE_FILTER else 'off'}({DEPTH_FILTER_KERNEL}) mask_blur={'on' if ENABLE_MASK_BLUR else 'off'}({MASK_BLUR_KERNEL}) kalman={'on' if ENABLE_KALMAN else 'off'}",
+		(10, 135),
+		font_scale=0.50,
+		thickness=1,
+	)
+
+	draw_outlined_text(
+		view,
+		f"adaptive_thr={'on' if ENABLE_ADAPTIVE_DIFF_THRESHOLD else 'off'} conf>={MIN_DETECTION_CONFIDENCE:.2f} validity_transition={'on' if ENABLE_VALIDITY_TRANSITION_TRIGGER else 'off'} sat_transition={'on' if ENABLE_SATURATION_TRANSITION_TRIGGER else 'off'} zero_clamp_invalid={'on' if INVALIDATE_ZERO_CLAMP_PIXELS else 'off'}",
+		(10, 155),
 		font_scale=0.50,
 		thickness=1,
 	)
@@ -634,7 +924,7 @@ def draw_overlay(display_bgr, state):
 		draw_outlined_text(
 			view,
 			f"triggered_at={state['trigger_timestamp']}",
-			(10, 135),
+			(10, 175),
 			font_scale=0.50,
 			thickness=1,
 		)
@@ -655,7 +945,7 @@ def draw_overlay(display_bgr, state):
 			click_text = f"click ({u},{v}) invalid"
 		else:
 			click_text = f"click ({u},{v}) depth={d:.3f} m / {d * 3.28084:.3f} ft"
-		draw_outlined_text(view, click_text, (10, 155), font_scale=0.52, thickness=1)
+		draw_outlined_text(view, click_text, (10, 195), font_scale=0.52, thickness=1)
 
 	return view
 
@@ -709,6 +999,8 @@ def rebuild_display_from_state(state):
 		return
 
 	invalid_mask = ~np.isfinite(state["depth_m"])
+	if state["display_invalid_mask"] is not None:
+		invalid_mask = state["display_invalid_mask"]
 	depth_bgr = depth_to_colormap(state["depth_m"], invalid_mask, state["max_depth_m"])
 	if state["show_workflow"]:
 		state["display_bgr"] = build_workflow_view(depth_bgr, state)
@@ -732,6 +1024,7 @@ def main():
 		"phase_rad": None,
 		"depth_m": None,
 		"depth_filtered_m": None,
+		"display_invalid_mask": None,
 		"display_bgr": None,
 		"modulation_hz": MODULATION_HZ,
 		"max_depth_m": MAX_DEPTH_M,
@@ -741,6 +1034,8 @@ def main():
 		"candidate_mask": None,
 		"post_blur_mask": None,
 		"diff_m": None,
+		"adaptive_threshold_m": None,
+		"amp_confidence": None,
 		"foreground_pixels": 0,
 		"largest_blob_pixels": 0,
 		"smoothed_blob_pixels": 0.0,
@@ -750,6 +1045,9 @@ def main():
 		"trigger_counter": 0,
 		"triggered": False,
 		"trigger_timestamp": None,
+		"integration_profile_index": -1,
+		"integration_slot": None,
+		"integration_raw": None,
 	}
 	cv2.setMouseCallback(WINDOW_NAME, on_mouse, state)
 
@@ -793,15 +1091,22 @@ def main():
 						log_event("Frame request timed out or incomplete")
 						continue
 
-					phase_rad, depth_m, invalid_mask = compute_phase_and_depth(
+					phase_rad, depth_m, sat_mask, low_signal_mask, amplitude_lsb, zero_clamped_mask = compute_phase_and_depth(
 						dcs_frames,
 						state["depth_scale_m_per_rad"],
 						state["max_depth_m"],
 					)
 
-					update_intruder_detection(state, depth_m, invalid_mask)
+					update_intruder_detection(
+						state,
+						depth_m,
+						sat_mask,
+						amplitude_lsb,
+						extra_invalid_mask=zero_clamped_mask,
+					)
 
-					depth_bgr = depth_to_colormap(depth_m, invalid_mask, state["max_depth_m"])
+					display_invalid_mask = sat_mask | low_signal_mask | zero_clamped_mask
+					depth_bgr = depth_to_colormap(depth_m, display_invalid_mask, state["max_depth_m"])
 					if state["show_workflow"]:
 						display_bgr = build_workflow_view(depth_bgr, state)
 					else:
@@ -814,6 +1119,7 @@ def main():
 					state["dcs_frames"] = dcs_frames
 					state["phase_rad"] = phase_rad
 					state["depth_m"] = depth_m
+					state["display_invalid_mask"] = display_invalid_mask
 					state["display_bgr"] = display_bgr
 
 				if state["display_bgr"] is not None:
@@ -839,6 +1145,8 @@ def main():
 					resize_for_view_mode(state["show_workflow"])
 					rebuild_display_from_state(state)
 					log_event("Workflow view ON" if state["show_workflow"] else "Workflow view OFF")
+				if key == ord("i"):
+					cycle_integration_profile(ser, state)
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")
