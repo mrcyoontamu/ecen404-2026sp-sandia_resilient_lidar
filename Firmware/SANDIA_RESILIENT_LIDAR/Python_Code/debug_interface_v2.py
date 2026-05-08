@@ -32,8 +32,14 @@ SPEED_OF_LIGHT_M_PER_S = 299792458.0
 # Datasheet 9.2.2 guidance: amplitudes below ~25 LSB are not useful for distance.
 AMPLITUDE_MIN_LSB = 25.0
 
-# Distance offset (DOFFSET in datasheet equation [2]). Keep 0 until calibrated.
-DISTANCE_OFFSET_M = -1.8
+# Distance offset (DOFFSET in datasheet equation [2]).
+# Calibrated values per modulation divider to keep distance consistent when
+# toggling between 24MHz (divider 0) and 12MHz (divider 1).
+DISTANCE_OFFSET_BY_DIVIDER_M = {
+	0: -2.15,	# 24MHz calibration
+	1: 0.85,	# 12MHz calibration (compensates observed ~3.0m low bias)
+}
+DISTANCE_OFFSET_M = DISTANCE_OFFSET_BY_DIVIDER_M[0]
 
 # For calibration, keep negative-offset results clamped at 0 m rather than wrapped
 # to the unambiguous max range (which can look like ~20 ft at 24 MHz).
@@ -72,6 +78,9 @@ INTEGRATION_PROFILES = [
 	(6, 38399),
 	(12, 38399),
 ]
+
+# Divider 0 -> 24MHz, divider 1 -> 12MHz.
+MODULATION_PROFILES = [0, 1]
 
 _usb_command_sequence = 0
 
@@ -397,6 +406,39 @@ def cycle_integration_profile(ser, state):
 	return result
 
 
+def set_distance_offset_for_divider(divider):
+	global DISTANCE_OFFSET_M
+	if divider in DISTANCE_OFFSET_BY_DIVIDER_M:
+		DISTANCE_OFFSET_M = float(DISTANCE_OFFSET_BY_DIVIDER_M[divider])
+
+
+def cycle_modulation_profile(ser, state):
+	next_index = (state["modulation_profile_index"] + 1) % len(MODULATION_PROFILES)
+	divider = MODULATION_PROFILES[next_index]
+
+	# Drop any stale bytes before waiting for a command response frame.
+	flush_serial_input(ser)
+	result = set_modulation_divider(ser, divider)
+
+	if result.get("ok", False):
+		state["modulation_profile_index"] = next_index
+		set_distance_offset_for_divider(divider)
+		new_mod_hz = modulation_hz_from_divider(divider)
+		if new_mod_hz is not None:
+			state["modulation_hz"] = new_mod_hz
+			state["max_depth_m"], state["depth_scale_m_per_rad"] = compute_depth_params(new_mod_hz)
+		log_event(
+			f"Modulation set: divider={divider} fLED={state['modulation_hz'] / 1e6:.3f}MHz "
+			f"offset={DISTANCE_OFFSET_M:.3f}m"
+		)
+	else:
+		log_event(f"Modulation set failed: divider={divider} status={result.get('status')}")
+
+	# Keep stream parser in a clean state after config response traffic.
+	flush_serial_input(ser)
+	return result
+
+
 def compute_depth_params(modulation_hz):
 	max_depth_m = SPEED_OF_LIGHT_M_PER_S / (2.0 * modulation_hz)
 	depth_scale_m_per_rad = SPEED_OF_LIGHT_M_PER_S / (4.0 * np.pi * modulation_hz)
@@ -536,6 +578,56 @@ def depth_to_colormap(depth_m, invalid_mask, max_depth_m):
 	return bgr
 
 
+def box_mean_depth_at(depth_m, u, v, kernel_size=3):
+	if depth_m is None:
+		return np.nan
+
+	half = max(0, int(kernel_size) // 2)
+	u0 = max(0, u - half)
+	u1 = min(depth_m.shape[1], u + half + 1)
+	v0 = max(0, v - half)
+	v1 = min(depth_m.shape[0], v + half + 1)
+
+	patch = depth_m[v0:v1, u0:u1]
+	valid = patch[np.isfinite(patch)]
+	if valid.size == 0:
+		return np.nan
+	return float(np.mean(valid))
+
+
+def update_clicked_depth_metrics(state, reset_history=False):
+	if reset_history:
+		state["clicked_depth_history"] = []
+		state["clicked_depth_3x3_m"] = np.nan
+		state["clicked_depth_roll5_m"] = np.nan
+
+	if state.get("clicked_uv") is None or state.get("depth_m") is None:
+		return
+
+	u, v = state["clicked_uv"]
+	depth_m = state["depth_m"]
+	if u < 0 or u >= depth_m.shape[1] or v < 0 or v >= depth_m.shape[0]:
+		return
+
+	depth_3x3 = box_mean_depth_at(depth_m, u, v, kernel_size=3)
+	state["clicked_depth_3x3_m"] = depth_3x3
+
+	history = state.get("clicked_depth_history")
+	if history is None:
+		history = []
+		state["clicked_depth_history"] = history
+
+	if np.isfinite(depth_3x3):
+		history.append(depth_3x3)
+		if len(history) > 5:
+			del history[:-5]
+
+	if history:
+		state["clicked_depth_roll5_m"] = float(np.mean(history))
+	else:
+		state["clicked_depth_roll5_m"] = np.nan
+
+
 def save_snapshot(state):
 	if state["depth_m"] is None:
 		print("No frame available to save yet.")
@@ -576,20 +668,23 @@ def on_mouse(event, x, y, flags, state):
 		return
 
 	state["clicked_uv"] = (u, v)
+	update_clicked_depth_metrics(state, reset_history=True)
 	d = depth_m[v, u]
+	d3 = state.get("clicked_depth_3x3_m", np.nan)
+	roll5 = state.get("clicked_depth_roll5_m", np.nan)
 	p = state["phase_rad"][v, u]
 	f0 = int(state["dcs_frames"][0][v, u])
 	f1 = int(state["dcs_frames"][1][v, u])
 	f2 = int(state["dcs_frames"][2][v, u])
 	f3 = int(state["dcs_frames"][3][v, u])
 
-	if np.isnan(d):
-		print(f"Click ({u}, {v}) -> invalid/saturated pixel")
-	else:
-		print(
-			f"Click ({u}, {v}) -> depth={d:.4f} m ({d * 3.28084:.3f} ft), "
-			f"phase={p:.4f} rad, DCS=[{f0}, {f1}, {f2}, {f3}]"
-		)
+	raw_text = "invalid/saturated" if np.isnan(d) else f"{d:.4f} m ({d * 3.28084:.3f} ft)"
+	box_text = "invalid" if np.isnan(d3) else f"{d3:.4f} m ({d3 * 3.28084:.3f} ft)"
+	roll_text = "invalid" if np.isnan(roll5) else f"{roll5:.4f} m ({roll5 * 3.28084:.3f} ft)"
+	print(
+		f"Click ({u}, {v}) -> raw={raw_text}, box3x3={box_text}, roll5={roll_text}, "
+		f"phase={p:.4f} rad, DCS=[{f0}, {f1}, {f2}, {f3}]"
+	)
 
 
 def draw_overlay(display_bgr, state):
@@ -599,12 +694,12 @@ def draw_overlay(display_bgr, state):
 	draw_outlined_text(view, f"{status}  FPS {state['fps']:.1f}", (10, 24), font_scale=0.7, thickness=2)
 	draw_outlined_text(
 		view,
-		f"mod {state['modulation_hz'] / 1e6:.2f} MHz | Dmax {state['max_depth_m']:.2f} m",
+		f"mod {state['modulation_hz'] / 1e6:.2f} MHz | Dmax {state['max_depth_m']:.2f} m | offset {DISTANCE_OFFSET_M:.2f} m",
 		(10, 49),
 		font_scale=0.52,
 		thickness=1,
 	)
-	draw_outlined_text(view, "keys: q quit | space pause | s save | i cycle integration", (10, 72), font_scale=0.5, thickness=1)
+	draw_outlined_text(view, "keys: q quit | space pause | s save | i cycle integration | m cycle modulation", (10, 72), font_scale=0.5, thickness=1)
 
 	if state["integration_slot"] is None:
 		int_text = "integration: not set (press i)"
@@ -619,11 +714,22 @@ def draw_overlay(display_bgr, state):
 		cv2.drawMarker(view, (x, y), (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
 
 		d = state["depth_m"][v, u]
+		d3 = state.get("clicked_depth_3x3_m", np.nan)
+		roll5 = state.get("clicked_depth_roll5_m", np.nan)
 		if np.isnan(d):
-			text = f"({u},{v}) invalid"
+			text = f"({u},{v}) raw invalid"
 		else:
-			text = f"({u},{v}) {d:.3f} m / {d * 3.28084:.3f} ft"
+			text = f"({u},{v}) raw {d:.3f} m / {d * 3.28084:.3f} ft"
 		draw_outlined_text(view, text, (10, 118), font_scale=0.55, thickness=2)
+
+		if np.isnan(d3):
+			stats_text = "3x3 box invalid | roll5 invalid"
+		else:
+			if np.isnan(roll5):
+				stats_text = f"3x3 box {d3:.3f} m | roll5 invalid"
+			else:
+				stats_text = f"3x3 box {d3:.3f} m | roll5 {roll5:.3f} m"
+		draw_outlined_text(view, stats_text, (10, 141), font_scale=0.52, thickness=1)
 
 	return view
 
@@ -635,6 +741,9 @@ def main():
 	state = {
 		"paused": False,
 		"clicked_uv": None,
+		"clicked_depth_3x3_m": np.nan,
+		"clicked_depth_roll5_m": np.nan,
+		"clicked_depth_history": [],
 		"dcs_frames": None,
 		"phase_rad": None,
 		"depth_m": None,
@@ -645,6 +754,7 @@ def main():
 		"fps": 0.0,
 		"fps_frame_counter": 0,
 		"fps_last_t": time.monotonic(),
+		"modulation_profile_index": -1,
 		"integration_profile_index": -1,
 		"integration_slot": None,
 		"integration_raw": None,
@@ -674,6 +784,9 @@ def main():
 								md = int(md_str, 10)
 							except ValueError:
 								md = -1
+							if md in MODULATION_PROFILES:
+								state["modulation_profile_index"] = MODULATION_PROFILES.index(md)
+								set_distance_offset_for_divider(md)
 							new_mod_hz = modulation_hz_from_divider(md)
 							if new_mod_hz is not None and abs(new_mod_hz - state["modulation_hz"]) > 1.0:
 								state["modulation_hz"] = new_mod_hz
@@ -707,6 +820,7 @@ def main():
 					state["phase_rad"] = phase_rad
 					state["depth_m"] = depth_m
 					state["display_bgr"] = display_bgr
+					update_clicked_depth_metrics(state)
 
 					state["fps_frame_counter"] += 1
 					now_fps = time.monotonic()
@@ -732,6 +846,8 @@ def main():
 					save_snapshot(state)
 				if key == ord("i"):
 					cycle_integration_profile(ser, state)
+				if key == ord("m"):
+					cycle_modulation_profile(ser, state)
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")

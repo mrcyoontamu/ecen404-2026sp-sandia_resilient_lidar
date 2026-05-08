@@ -30,10 +30,10 @@ MODULATION_HZ = DEFAULT_MODULATION_HZ
 SPEED_OF_LIGHT_M_PER_S = 299792458.0
 
 # Datasheet 9.2.2 guidance: amplitudes below this LSB threshold are not useful for distance.
-AMPLITUDE_MIN_LSB = 25.0
+AMPLITUDE_MIN_LSB = 30.0
 
 # Distance offset (DOFFSET in datasheet equation [2]). Keep 0 until calibrated.
-DISTANCE_OFFSET_M = -2.25
+DISTANCE_OFFSET_M = -2.15
 
 # For calibration, keep negative-offset results clamped at 0 m rather than wrapped
 # to the unambiguous max range.
@@ -53,12 +53,13 @@ EXCLUDED_KEYWORDS = ("stlink", "st-link", "debugger")
 WINDOW_NAME = "Intruder Detection"
 DISPLAY_SCALE = 3
 SHOW_FILTER_WORKFLOW = True
+SHOW_OVERLAY = True
 
 # Intruder algorithm tuning.
 DIFF_THRESHOLD_M = 0.1
-MIN_BLOB_AREA_PIXELS = 25
-BLOB_TRIGGER_PIXELS = 30
-TEMPORAL_TRIGGER_FRAMES = 1
+MIN_BLOB_AREA_PIXELS = 75
+BLOB_TRIGGER_PIXELS = 150
+TEMPORAL_TRIGGER_FRAMES = 2
 MASK_BLUR_KERNEL = 11
 ENABLE_MASK_BLUR = True
 ENABLE_DEPTH_PRE_FILTER = True
@@ -74,6 +75,13 @@ ENABLE_VALIDITY_TRANSITION_TRIGGER = False
 VALIDITY_TRANSITION_MIN_CONFIDENCE = 0.65
 ENABLE_SATURATION_TRANSITION_TRIGGER = True
 
+# Auto-refresh background reference every N processed frames.
+# Set to 0 to disable automatic background updates.
+AUTO_BACKGROUND_UPDATE_FRAMES = 10
+
+# On first trigger after rearm, save detection frame plus N-1 following frames.
+DETECTION_CAPTURE_FRAME_COUNT = 5
+
 # When depth gets clipped to 0.0 m by offset/clamping, optionally treat
 # those pixels as invalid so they do not create false edge alarms.
 INVALIDATE_ZERO_CLAMP_PIXELS = True
@@ -81,7 +89,7 @@ ZERO_DEPTH_INVALID_EPS_M = 0.01
 
 # Kalman smoothing for largest contiguous blob area (pixels).
 ENABLE_KALMAN = True
-KALMAN_USE_FOR_TRIGGER = True
+KALMAN_USE_FOR_TRIGGER = False
 KALMAN_MAX_MISSED_FRAMES = 8
 KALMAN_PROCESS_NOISE = 8
 KALMAN_MEASUREMENT_NOISE = 300
@@ -201,13 +209,24 @@ def pick_target_port():
 
 
 def connect_with_retry(baud, timeout):
+	def wait_or_quit(delay_s):
+		deadline = time.monotonic() + delay_s
+		while time.monotonic() < deadline:
+			# Allow quitting before a serial device is connected.
+			key = cv2.waitKey(50) & 0xFF
+			if key == ord("q"):
+				return True
+			time.sleep(0.05)
+		return False
+
 	while True:
 		port = pick_target_port()
 		if port is None:
 			print("No matching serial device found.")
 			print(f"Available ports: {list_available_ports()}")
-			print(f"Retrying in {RECONNECT_INTERVAL_S} seconds... (Ctrl+C to quit)")
-			time.sleep(RECONNECT_INTERVAL_S)
+			print(f"Retrying in {RECONNECT_INTERVAL_S} seconds... (press q in window or Ctrl+C to quit)")
+			if wait_or_quit(RECONNECT_INTERVAL_S):
+				return None
 			continue
 
 		try:
@@ -218,8 +237,9 @@ def connect_with_retry(baud, timeout):
 		except serial.SerialException as exc:
 			print(f"Connect failed for {port}: {exc}")
 			print(f"Available ports: {list_available_ports()}")
-			print(f"Retrying in {RECONNECT_INTERVAL_S} seconds... (Ctrl+C to quit)")
-			time.sleep(RECONNECT_INTERVAL_S)
+			print(f"Retrying in {RECONNECT_INTERVAL_S} seconds... (press q in window or Ctrl+C to quit)")
+			if wait_or_quit(RECONNECT_INTERVAL_S):
+				return None
 
 
 def find_header(ser):
@@ -763,6 +783,10 @@ def rearm_detection(state):
 	state["trigger_metric_pixels"] = 0.0
 	state["blob_area_kf"] = None
 	state["blob_missed_frames"] = 0
+	state["detection_capture_used"] = False
+	state["detection_capture_remaining"] = 0
+	state["detection_capture_index"] = 0
+	state["detection_capture_stamp"] = None
 	log_event("System rearmed. Press 'b' to capture a new background.")
 
 
@@ -778,7 +802,78 @@ def capture_background(state):
 	state["trigger_counter"] = 0
 	state["triggered"] = False
 	state["trigger_timestamp"] = None
+	state["frames_since_bg_update"] = 0
 	log_event("Background captured (filtered depth reference)")
+
+
+def maybe_auto_update_background(state):
+	if AUTO_BACKGROUND_UPDATE_FRAMES <= 0:
+		return
+
+	if state["depth_filtered_m"] is None:
+		return
+
+	# Avoid adapting the background while the detector is latched.
+	if state["triggered"]:
+		state["frames_since_bg_update"] = 0
+		return
+
+	if state["ref_depth_m"] is None:
+		state["ref_depth_m"] = state["depth_filtered_m"].copy()
+		state["frames_since_bg_update"] = 0
+		log_event("Background initialized (auto)")
+		return
+
+	state["frames_since_bg_update"] += 1
+	if state["frames_since_bg_update"] < AUTO_BACKGROUND_UPDATE_FRAMES:
+		return
+
+	current = state["depth_filtered_m"]
+	updated = state["ref_depth_m"].copy()
+	valid_now = np.isfinite(current)
+	updated[valid_now] = current[valid_now]
+	state["ref_depth_m"] = updated
+	state["frames_since_bg_update"] = 0
+	log_event("Background refreshed (auto)")
+
+
+def maybe_start_detection_capture_sequence(state, just_triggered):
+	if DETECTION_CAPTURE_FRAME_COUNT <= 0:
+		return
+
+	if (not just_triggered) or state["detection_capture_used"]:
+		return
+
+	state["detection_capture_used"] = True
+	state["detection_capture_remaining"] = DETECTION_CAPTURE_FRAME_COUNT
+	state["detection_capture_index"] = 0
+	state["detection_capture_stamp"] = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+	log_event(f"Detection capture armed: saving {DETECTION_CAPTURE_FRAME_COUNT} frames")
+
+
+def maybe_save_detection_capture_frame(state):
+	if state["detection_capture_remaining"] <= 0:
+		return
+
+	if state["display_bgr"] is None:
+		return
+
+	os.makedirs("captures", exist_ok=True)
+	stamp = state["detection_capture_stamp"]
+	index = state["detection_capture_index"]
+	png_path = os.path.join("captures", f"detect_{stamp}_f{index:02d}.png")
+
+	output_bgr = draw_overlay(state["display_bgr"], state, detailed=state.get("show_overlay", True))
+	cv2.imwrite(png_path, output_bgr)
+
+	state["detection_capture_index"] += 1
+	state["detection_capture_remaining"] -= 1
+	log_event(
+		f"Saved detection frame {state['detection_capture_index']}/{DETECTION_CAPTURE_FRAME_COUNT}: {png_path}"
+	)
+
+	if state["detection_capture_remaining"] == 0:
+		log_event("Detection capture complete (rearm required for next auto-save)")
 
 
 def make_mask_bgr(mask):
@@ -854,7 +949,7 @@ def on_mouse(event, x, y, flags, state):
 		)
 
 
-def draw_overlay(display_bgr, state):
+def draw_overlay(display_bgr, state, detailed=True):
 	view = display_bgr.copy()
 
 	base = "PAUSED" if state["paused"] else "LIVE"
@@ -874,9 +969,21 @@ def draw_overlay(display_bgr, state):
 			2,
 		)
 
+	if (not state["show_workflow"]) and state["fg_mask"] is not None:
+		mask_small = cv2.resize(
+			state["fg_mask"],
+			(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
+			interpolation=cv2.INTER_NEAREST,
+		)
+		# Highlight detected foreground in red over the depth map.
+		view[mask_small > 0] = (0, 0, 255)
+
+	if not detailed:
+		return view
+
 	draw_outlined_text(
 		view,
-		"keys: q quit | space pause | s save | b bg capture | r rearm | w workflow | i integration",
+		"keys: q quit | space pause | s save | b bg capture | r rearm | w workflow | o overlay | i integration",
 		(10, 55),
 		font_scale=0.48,
 		thickness=1,
@@ -920,23 +1027,22 @@ def draw_overlay(display_bgr, state):
 		thickness=1,
 	)
 
+	draw_outlined_text(
+		view,
+		f"auto_bg={'off' if AUTO_BACKGROUND_UPDATE_FRAMES <= 0 else f'every {AUTO_BACKGROUND_UPDATE_FRAMES} frames'}",
+		(10, 175),
+		font_scale=0.50,
+		thickness=1,
+	)
+
 	if state["trigger_timestamp"] is not None:
 		draw_outlined_text(
 			view,
 			f"triggered_at={state['trigger_timestamp']}",
-			(10, 175),
+			(10, 195),
 			font_scale=0.50,
 			thickness=1,
 		)
-
-	if (not state["show_workflow"]) and state["fg_mask"] is not None:
-		mask_small = cv2.resize(
-			state["fg_mask"],
-			(FRAME_WIDTH * DISPLAY_SCALE, FRAME_HEIGHT * DISPLAY_SCALE),
-			interpolation=cv2.INTER_NEAREST,
-		)
-		# Highlight detected foreground in red over the depth map.
-		view[mask_small > 0] = (0, 0, 255)
 
 	if state["clicked_uv"] is not None and state["depth_m"] is not None:
 		u, v = state["clicked_uv"]
@@ -945,7 +1051,7 @@ def draw_overlay(display_bgr, state):
 			click_text = f"click ({u},{v}) invalid"
 		else:
 			click_text = f"click ({u},{v}) depth={d:.3f} m / {d * 3.28084:.3f} ft"
-		draw_outlined_text(view, click_text, (10, 195), font_scale=0.52, thickness=1)
+		draw_outlined_text(view, click_text, (10, 215), font_scale=0.52, thickness=1)
 
 	return view
 
@@ -976,8 +1082,8 @@ def save_snapshot(state):
 	)
 
 	if state["display_bgr"] is not None:
-		overlay = draw_overlay(state["display_bgr"], state)
-		cv2.imwrite(png_path, overlay)
+		output_bgr = draw_overlay(state["display_bgr"], state, detailed=state.get("show_overlay", True))
+		cv2.imwrite(png_path, output_bgr)
 
 	print(f"Saved: {npz_path}")
 	print(f"Saved: {png_path}")
@@ -1019,6 +1125,7 @@ def main():
 	state = {
 		"paused": False,
 		"show_workflow": SHOW_FILTER_WORKFLOW,
+		"show_overlay": SHOW_OVERLAY,
 		"clicked_uv": None,
 		"dcs_frames": None,
 		"phase_rad": None,
@@ -1048,6 +1155,11 @@ def main():
 		"integration_profile_index": -1,
 		"integration_slot": None,
 		"integration_raw": None,
+		"frames_since_bg_update": 0,
+		"detection_capture_used": False,
+		"detection_capture_remaining": 0,
+		"detection_capture_index": 0,
+		"detection_capture_stamp": None,
 	}
 	cv2.setMouseCallback(WINDOW_NAME, on_mouse, state)
 
@@ -1058,6 +1170,9 @@ def main():
 		while True:
 			if ser is None:
 				ser = connect_with_retry(BAUD, TIMEOUT)
+				if ser is None:
+					log_event("Quit requested before serial connection")
+					break
 				next_status_poll = time.monotonic()
 				log_event("Capture loop armed")
 
@@ -1097,6 +1212,8 @@ def main():
 						state["max_depth_m"],
 					)
 
+					was_triggered = state["triggered"]
+
 					update_intruder_detection(
 						state,
 						depth_m,
@@ -1122,8 +1239,15 @@ def main():
 					state["display_invalid_mask"] = display_invalid_mask
 					state["display_bgr"] = display_bgr
 
+					maybe_auto_update_background(state)
+					maybe_start_detection_capture_sequence(
+						state,
+						just_triggered=((not was_triggered) and state["triggered"]),
+					)
+					maybe_save_detection_capture_frame(state)
+
 				if state["display_bgr"] is not None:
-					view = draw_overlay(state["display_bgr"], state)
+					view = draw_overlay(state["display_bgr"], state, detailed=state.get("show_overlay", True))
 					cv2.imshow(WINDOW_NAME, view)
 
 				key = cv2.waitKey(30 if state["paused"] else 1) & 0xFF
@@ -1147,6 +1271,9 @@ def main():
 					log_event("Workflow view ON" if state["show_workflow"] else "Workflow view OFF")
 				if key == ord("i"):
 					cycle_integration_profile(ser, state)
+				if key == ord("o"):
+					state["show_overlay"] = not state["show_overlay"]
+					log_event("Overlay ON" if state["show_overlay"] else "Overlay OFF")
 
 			except (serial.SerialException, OSError) as exc:
 				log_event(f"Serial link lost: {exc}")

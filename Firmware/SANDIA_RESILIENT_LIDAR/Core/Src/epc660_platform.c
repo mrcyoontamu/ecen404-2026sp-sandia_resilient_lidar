@@ -238,3 +238,75 @@ epc_status_t epc_i2c_read_multi(uint8_t reg_addr, uint8_t *data, uint16_t len)
 
     return _map_hal_status(status);
 }
+
+epc_status_t epc_i2c_recover_bus(void)
+{
+	GPIO_InitTypeDef gpio_init = {0};
+
+	// Reset the I2C peripheral state machine first.
+	(void)HAL_I2C_DeInit(&hi2c2);
+	__HAL_RCC_I2C2_FORCE_RESET();
+	__HAL_RCC_I2C2_RELEASE_RESET();
+
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	// Temporarily take over SCL/SDA as open-drain GPIO to recover a stuck slave.
+	gpio_init.Pin = GPIO_PIN_10 | GPIO_PIN_11;
+	gpio_init.Mode = GPIO_MODE_OUTPUT_OD;
+	gpio_init.Pull = GPIO_PULLUP;
+	gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOB, &gpio_init);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_PIN_SET);
+	epc_delay_ms(1);
+
+	// If SDA is held low, clock SCL up to 16 times to release the bus.
+	if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_RESET)
+	{
+		for (uint32_t i = 0; i < 16U; i++)
+		{
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+			epc_delay_ms(1);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+			epc_delay_ms(1);
+
+			if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_SET)
+			{
+				break;
+			}
+		}
+	}
+
+	// Emit a STOP condition while still in GPIO mode.
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
+	epc_delay_ms(1);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+	epc_delay_ms(1);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+	epc_delay_ms(1);
+
+	// Restore I2C alternate function pins.
+	gpio_init.Pin = GPIO_PIN_10 | GPIO_PIN_11;
+	gpio_init.Mode = GPIO_MODE_AF_OD;
+	gpio_init.Pull = GPIO_NOPULL;
+	gpio_init.Speed = GPIO_SPEED_FREQ_MEDIUM;
+	gpio_init.Alternate = GPIO_AF4_I2C2;
+	HAL_GPIO_Init(GPIOB, &gpio_init);
+
+	if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+	{
+		return EPC_ERR;
+	}
+
+	if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+	{
+		return EPC_ERR;
+	}
+
+	if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+	{
+		return EPC_ERR;
+	}
+
+	return EPC_OK;
+}

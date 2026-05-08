@@ -268,6 +268,7 @@ int main(void)
   uint32_t loop_tick = 0;
   uint32_t frame_timeout_ms = 5000;
 
+  (void)epc_i2c_recover_bus();
   epc_status_t init_status = epc660_power_up();
   if (init_status == EPC_OK)
   {
@@ -770,11 +771,20 @@ static void power_down_epc660(void)
 
   epc660_power_down();
   epc660_power_state = EPC660_POWER_OFF;
+
+  // Keep USB reachable even when EPC rails are off so host-side diagnostics
+  // and recovery commands remain available.
+  usb_start_nonfatal();
 }
 
 static epc_status_t power_up_epc660_and_resume_capture(void)
 {
   uint8_t was_powered_off = (epc660_power_state == EPC660_POWER_OFF) ? 1U : 0U;
+
+  if (epc_i2c_recover_bus() != EPC_OK)
+  {
+    // Continue with power-up attempt even if bus recovery did not report success.
+  }
 
   if (epc660_power_up() != EPC_OK)
   {

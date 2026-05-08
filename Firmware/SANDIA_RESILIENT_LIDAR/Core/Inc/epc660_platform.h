@@ -43,5 +43,6 @@ epc_status_t epc_i2c_write(uint8_t reg_addr, uint8_t value, epc_i2c_access_t typ
 epc_status_t epc_i2c_read(uint8_t reg_addr, uint8_t *value, epc_i2c_access_t type);
 epc_status_t epc_i2c_write_multi(uint8_t reg_addr, const uint8_t *data, uint16_t len);
 epc_status_t epc_i2c_read_multi(uint8_t reg_addr, uint8_t *data, uint16_t len);
+epc_status_t epc_i2c_recover_bus(void);
 
 #endif /* INC_EPC660_PLATFORM_H_ */
